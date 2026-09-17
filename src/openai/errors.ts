@@ -8,6 +8,7 @@ export type ApiErrorCode =
   | 'not_found'
   | 'insufficient_quota'
   | 'rate_limit_exceeded'
+  | 'context_length_exceeded'
   | 'upstream_authentication_error'
   | 'upstream_timeout'
   | 'upstream_error'
@@ -23,6 +24,7 @@ const TYPE_BY_CODE: Record<ApiErrorCode, string> = {
   not_found: 'invalid_request_error',
   insufficient_quota: 'insufficient_quota',
   rate_limit_exceeded: 'rate_limit_error',
+  context_length_exceeded: 'invalid_request_error',
   upstream_authentication_error: 'upstream_authentication_error',
   upstream_timeout: 'timeout_error',
   upstream_error: 'upstream_error',
@@ -39,6 +41,7 @@ const STATUS_BY_CODE: Record<ApiErrorCode, number> = {
   not_found: 404,
   insufficient_quota: 429,
   rate_limit_exceeded: 429,
+  context_length_exceeded: 400,
   upstream_authentication_error: 502,
   upstream_timeout: 504,
   upstream_error: 502,

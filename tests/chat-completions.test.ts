@@ -213,6 +213,29 @@ test('upstream credential rejections become a retryable 429 and quarantine the a
   assert.equal(context.store.logs().entries[0]!.status, 429);
 });
 
+test('a context overflow comes back as context_length_exceeded', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () =>
+    json(
+      {
+        error: {
+          code: 'invalid_request',
+          message:
+            "This model's maximum context length is 200000 tokens. However, you requested 260000 tokens.",
+        },
+      },
+      400,
+    );
+  const response = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(response.statusCode, 400);
+  const body = response.json<{ error: { code: string; message: string } }>();
+  assert.equal(body.error.code, 'context_length_exceeded');
+  assert.match(body.error.message, /context .*exceed/i);
+  // An oversized prompt is the client's problem, so the account stays usable.
+  assert.equal(context.store.accounts()[0]!.enabled, true);
+  assert.equal(context.store.availability().available, 1);
+});
+
 test('upstream rate limits and quota failures keep their meaning', async (t) => {
   const context = await fixture(t);
   context.upstream.handler = () =>

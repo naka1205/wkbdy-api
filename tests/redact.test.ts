@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isAccountBlocked, isCredentialFailure, isQuotaFailure, redactError } from '../src/errors.js';
+import {
+  isAccountBlocked,
+  isContextOverflow,
+  isCredentialFailure,
+  isQuotaFailure,
+  redactError,
+} from '../src/errors.js';
 
 test('known secrets never survive redaction', () => {
   const secret = 'sk-live-abcdefghijklmnop';
@@ -36,4 +42,25 @@ test('risk-control blocks are told apart from ordinary failures', () => {
   assert.equal(isAccountBlocked(undefined, '该账号已被封控'), true);
   assert.equal(isAccountBlocked(undefined, '账户余额不足'), false);
   assert.equal(isAccountBlocked(undefined, 'account has been suspended'), true);
+});
+
+test('context overflows are recognised from code or message', () => {
+  // The spellings Codex and ZCode look for.
+  assert.equal(isContextOverflow(400, 'context_length_exceeded', undefined), true);
+  assert.equal(isContextOverflow(400, 'prompt_too_long', undefined), true);
+  assert.equal(
+    isContextOverflow(
+      400,
+      undefined,
+      "This model's maximum context length is 65536 tokens. However, you requested 90000 tokens.",
+    ),
+    true,
+  );
+  assert.equal(
+    isContextOverflow(400, undefined, 'Your input exceeds the context window of this model.'),
+    true,
+  );
+  assert.equal(isContextOverflow(400, undefined, '输入内容过长，请减少上下文'), true);
+  assert.equal(isContextOverflow(400, undefined, 'invalid function arguments'), false);
+  assert.equal(isContextOverflow(500, undefined, 'context service unavailable'), false);
 });

@@ -27,7 +27,9 @@ import {
   CredentialError,
   NoAvailableAccountsError,
   isAccountBlocked,
+  isContextOverflow,
   isQuotaFailure,
+  redactError,
 } from './errors.js';
 import { requestRecorder, type RequestOutcome } from './logging.js';
 import {
@@ -424,6 +426,17 @@ function mapHttpStatus(error: UpstreamHttpError): ReturnType<typeof openAiError>
   }
   if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
     return openAiError(429, 'insufficient_quota', 'Upstream quota or balance is exhausted.');
+  }
+  if (isContextOverflow(error.status, error.code, error.upstreamMessage)) {
+    // Clients (Codex, ZCode) only compact and retry when they recognise the
+    // failure, so keep both the canonical code and a matching message.
+    return openAiError(
+      400,
+      'context_length_exceeded',
+      `The model context window was exceeded: ${
+        redactError(error.upstreamMessage ?? '') || 'the prompt is too long'
+      }`,
+    );
   }
   switch (error.status) {
     case 401:

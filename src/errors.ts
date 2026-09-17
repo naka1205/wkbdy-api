@@ -93,6 +93,34 @@ export function isQuotaFailure(status: number, code?: unknown, message?: unknown
 }
 
 const BLOCKED_CODES = new Set(['410004']);
+
+/**
+ * Clients recover from an oversized prompt themselves: Codex marks the context
+ * full, ZCode runs "reactive compaction". Both only recognise the failure when
+ * the code (or message) is one of the canonical spellings below, so an
+ * upstream overflow has to be translated instead of passed through verbatim.
+ */
+const CONTEXT_OVERFLOW_CODES = new Set([
+  'context_length_exceeded',
+  'context_window_exceeded',
+  'context_exceeded',
+  'model_context_exceeded',
+  'model_context_window_exceeded',
+  'prompt_too_long',
+]);
+
+const CONTEXT_OVERFLOW_PATTERNS =
+  /(?:context|上下文)[^\n]{0,60}(?:exceed|overflow|too long|超(?:出|过|限))|(?:exceed|overflow|超(?:出|过))[^\n]{0,60}(?:context|上下文)|prompt is too long|maximum context length|input token count|range of input length should be|total message token length|输入(?:内容)?过长/i;
+
+export function isContextOverflow(status: number, code?: unknown, message?: unknown): boolean {
+  const normalized = String(code ?? '')
+    .trim()
+    .toLowerCase();
+  if (CONTEXT_OVERFLOW_CODES.has(normalized)) return true;
+  if (status >= 500) return false;
+  return typeof message === 'string' && CONTEXT_OVERFLOW_PATTERNS.test(message);
+}
+
 const BLOCKED_PATTERNS =
   /封控|风控|账号(?:被)?(?:封禁|封停|限制|禁用|停用)|account (?:has been )?(?:blocked|banned|suspended|restricted)/i;
 
