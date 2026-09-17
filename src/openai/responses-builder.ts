@@ -68,6 +68,8 @@ type ToolState = { id: string; callId: string; name: string; arguments: string }
 export class ResponsesBuilder {
   readonly responseId = localResponseId();
   readonly createdAt = Math.floor(Date.now() / 1000);
+  /** Stable id of the assistant message item, shared by every streamed event. */
+  readonly textItemId = localItemId('msg');
   private text = '';
   private sawFrame = false;
   private finishReason: string | null = null;
@@ -77,21 +79,32 @@ export class ResponsesBuilder {
   credits = 0;
   private readonly tools = new Map<number, ToolState>();
 
+  /** State of the tool item at `index`, created on first sight of the call. */
+  private toolState(index: number): ToolState {
+    const current = this.tools.get(index) ?? {
+      id: localItemId('fc'),
+      callId: '',
+      name: '',
+      arguments: '',
+    };
+    this.tools.set(index, current);
+    return current;
+  }
+
+  /** Id of the tool item at `index`, shared by every streamed event. */
+  toolItemId(index: number): string {
+    return this.toolState(index).id;
+  }
+
   push(chunk: UpstreamChunk): void {
     this.sawFrame = true;
     if (chunk.delta.content) this.text += chunk.delta.content;
     for (const call of chunk.delta.tool_calls ?? []) {
       const index = typeof call.index === 'number' ? call.index : 0;
-      const current = this.tools.get(index) ?? {
-        id: localItemId('fc'),
-        callId: '',
-        name: '',
-        arguments: '',
-      };
+      const current = this.toolState(index);
       if (call.id) current.callId = call.id;
       if (call.function?.name) current.name += call.function.name;
       if (call.function?.arguments) current.arguments += call.function.arguments;
-      this.tools.set(index, current);
     }
     if (chunk.finish_reason) this.finishReason = chunk.finish_reason;
     if (chunk.usage) {
@@ -126,7 +139,7 @@ export class ResponsesBuilder {
     const output: ResponseOutputItem[] = [];
     if (this.text) {
       output.push({
-        id: localItemId('msg'),
+        id: this.textItemId,
         type: 'message',
         status: 'completed',
         role: 'assistant',

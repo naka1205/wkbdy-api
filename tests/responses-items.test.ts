@@ -144,6 +144,56 @@ test('a streaming freeform call emits the custom input event', async (t) => {
   assert.ok(!response.body.includes('response.function_call_arguments.delta'));
 });
 
+test('every streamed event reuses the ItemDone item id', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () =>
+    sse(
+      `data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { content: 'thinking' }, finish_reason: null }],
+      })}\n\n` +
+        `data: ${JSON.stringify({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: 'call_5',
+                    type: 'function',
+                    function: { name: 'exec', arguments: '{"input":"1+1"}' },
+                  },
+                ],
+              },
+            },
+          ],
+        })}\n\n` +
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n` +
+        'data: [DONE]\n\n',
+    );
+  const response = await post(context, codexBody());
+  const frames = response.body
+    .split('\n\n')
+    .filter((frame) => frame.startsWith('event: '))
+    .map((frame) => {
+      const [, data] = frame.split('\ndata: ');
+      return JSON.parse(data!) as Record<string, never>;
+    });
+  const added = frames.filter((frame) => frame.type === 'response.output_item.added');
+  const dones = frames.filter((frame) => frame.type === 'response.output_item.done');
+  assert.equal(added.length, 2);
+  assert.equal(dones.length, 2);
+  for (const [index, done] of dones.entries()) {
+    assert.equal(
+      (done.item as unknown as { id: string }).id,
+      (added[index]!.item as unknown as { id: string }).id,
+    );
+  }
+  const customDone = frames.find((frame) => frame.type === 'response.custom_tool_call_input.done')!;
+  const toolDone = dones[1]!;
+  assert.equal(customDone.item_id, (toolDone.item as unknown as { id: string }).id);
+});
+
 test('custom tool call history round-trips', () => {
   const mapping = mapResponsesRequest(
     codexBody({

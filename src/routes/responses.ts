@@ -251,7 +251,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
         if (chunk.delta.content) {
           if (!textStarted) {
             textStarted = true;
-            messageId = `msg_${builder.responseId.slice(5)}`;
+            messageId = builder.textItemId;
             const item = {
               id: messageId,
               type: 'message',
@@ -281,7 +281,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
           let state = toolIds.get(index);
           if (!state) {
             state = {
-              itemId: `fc_${builder.responseId.slice(5)}_${index}`,
+              itemId: builder.toolItemId(index),
               callId: call.id ?? `call_${index}`,
               name: '',
               arguments: '',
