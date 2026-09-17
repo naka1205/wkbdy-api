@@ -113,6 +113,8 @@ export function openDatabase(dataDir: string): Database.Database {
       'logical_request_id TEXT',
       'client_attempt INTEGER',
       'upstream_request_id TEXT',
+      'endpoint TEXT',
+      'detail TEXT',
     ]) {
       if (!logColumns.includes(column.split(' ')[0]!))
         db.exec(`ALTER TABLE request_logs ADD COLUMN ${column}`);
@@ -131,7 +133,7 @@ export function openDatabase(dataDir: string): Database.Database {
     // The account's upstream e-mail, decoded from the Keycloak access token so
     // the panel can tell two upstream identities apart.
     if (!accountColumns.includes('email')) db.exec('ALTER TABLE accounts ADD COLUMN email TEXT');
-    db.pragma('user_version = 6');
+    db.pragma('user_version = 7');
   })();
   return db;
 }

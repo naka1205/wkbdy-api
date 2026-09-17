@@ -6,88 +6,76 @@ import {
   type UpstreamChatRequest,
 } from '../request.js';
 
-const inputText = z.object({ type: z.literal('input_text'), text: z.string() }).strict();
-const outputText = z.object({ type: z.literal('output_text'), text: z.string() }).strict();
-const inputImage = z
-  .object({
-    type: z.literal('input_image'),
-    image_url: z
-      .string()
-      .url()
-      .refine((value) => ['http:', 'https:', 'data:'].includes(new URL(value).protocol)),
-    detail: z.enum(['auto', 'low', 'high']).optional(),
-  })
-  .strict();
+const inputText = z.object({ type: z.literal('input_text'), text: z.string() });
+const outputText = z.object({ type: z.literal('output_text'), text: z.string() });
+const inputImage = z.object({
+  type: z.literal('input_image'),
+  image_url: z
+    .string()
+    .url()
+    .refine((value) => ['http:', 'https:', 'data:'].includes(new URL(value).protocol)),
+  detail: z.enum(['auto', 'low', 'high']).optional(),
+});
 
-const messageItem = z
-  .object({
-    type: z.literal('message').optional(),
-    role: z.enum(['user', 'assistant', 'system', 'developer']),
-    content: z.union([
-      z.string(),
-      z.array(z.discriminatedUnion('type', [inputText, outputText, inputImage])).min(1),
-    ]),
-  })
-  .strict();
+const messageItem = z.object({
+  type: z.literal('message').optional(),
+  role: z.enum(['user', 'assistant', 'system', 'developer']),
+  content: z.union([
+    z.string(),
+    z.array(z.discriminatedUnion('type', [inputText, outputText, inputImage])).min(1),
+  ]),
+});
 
-const functionCallItem = z
-  .object({
-    type: z.literal('function_call'),
-    call_id: z.string().min(1),
-    name: z.string().min(1),
-    arguments: z.string(),
-  })
-  .strict();
+const functionCallItem = z.object({
+  type: z.literal('function_call'),
+  call_id: z.string().min(1),
+  name: z.string().min(1),
+  arguments: z.string(),
+});
 
-const functionOutputItem = z
-  .object({
-    type: z.literal('function_call_output'),
-    call_id: z.string().min(1),
-    output: z.union([z.string(), z.array(inputText).min(1)]),
-  })
-  .strict();
+const functionOutputItem = z.object({
+  type: z.literal('function_call_output'),
+  call_id: z.string().min(1),
+  output: z.union([z.string(), z.array(inputText).min(1)]),
+});
 
-const functionTool = z
-  .object({
-    type: z.literal('function'),
-    name: z.string().min(1),
-    description: z.string().optional(),
-    parameters: z.object({ type: z.literal('object') }).passthrough(),
-    strict: z.boolean().optional(),
-  })
-  .strict();
+const functionTool = z.object({
+  type: z.literal('function'),
+  name: z.string().min(1),
+  description: z.string().optional(),
+  parameters: z.object({ type: z.literal('object') }).passthrough(),
+  strict: z.boolean().optional(),
+});
 
-export const responsesRequestSchema = z
-  .object({
-    model: z.string().min(1),
-    input: z.union([
-      z.string(),
-      z.array(z.discriminatedUnion('type', [messageItem, functionCallItem, functionOutputItem])).min(1),
-    ]),
-    instructions: z.string().optional(),
-    stream: z.boolean().default(false),
-    temperature: z.number().min(0).max(2).optional(),
-    top_p: z.number().min(0).max(1).optional(),
-    max_output_tokens: z.number().int().positive().optional(),
-    tools: z.array(functionTool).optional(),
-    tool_choice: z
-      .union([
-        z.enum(['none', 'auto', 'required']),
-        z.object({ type: z.literal('function'), name: z.string().min(1) }).strict(),
-      ])
-      .optional(),
-    parallel_tool_calls: z.boolean().optional(),
-    reasoning: z
-      .object({
-        effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
-      })
-      .strict()
-      .optional(),
-    thinking: thinkingSchema.optional(),
-    context_window: z.number().int().positive().optional(),
-    store: z.boolean().optional(),
-  })
-  .strict();
+export const responsesRequestSchema = z.object({
+  model: z.string().min(1),
+  input: z.union([
+    z.string(),
+    z.array(z.discriminatedUnion('type', [messageItem, functionCallItem, functionOutputItem])).min(1),
+  ]),
+  instructions: z.string().optional(),
+  stream: z.boolean().default(false),
+  temperature: z.number().min(0).max(2).optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  max_output_tokens: z.number().int().positive().optional(),
+  tools: z.array(functionTool).optional(),
+  tool_choice: z
+    .union([
+      z.enum(['none', 'auto', 'required']),
+      z.object({ type: z.literal('function'), name: z.string().min(1) }),
+    ])
+    .optional(),
+  parallel_tool_calls: z.boolean().optional(),
+  reasoning: z
+    .object({
+      effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
+    })
+
+    .optional(),
+  thinking: thinkingSchema.optional(),
+  context_window: z.number().int().positive().optional(),
+  store: z.boolean().optional(),
+});
 
 export type ResponsesRequest = z.infer<typeof responsesRequestSchema>;
 

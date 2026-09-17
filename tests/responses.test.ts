@@ -68,11 +68,21 @@ test('invalid Responses bodies and unknown models are rejected', async (t) => {
   const context = await fixture(t);
   assert.equal((await post(context, { model: 'deepseek-v4.1-flash' })).statusCode, 400);
   assert.equal((await post(context, { model: 'nope', input: 'x' })).statusCode, 404);
-  assert.equal(
-    (await post(context, { model: 'deepseek-v4.1-flash', input: 'x', nonsense: 1 })).statusCode,
-    400,
-  );
   assert.equal(context.upstream.calls.length, 0);
+});
+
+test('unknown Responses fields are ignored and recorded', async (t) => {
+  const context = await fixture(t);
+  const response = await post(context, {
+    model: 'deepseek-v4.1-flash',
+    input: 'x',
+    nonsense: 1,
+    prompt_cache_key: 'k',
+  });
+  assert.equal(response.statusCode, 200);
+  const entry = context.store.logs().entries[0]!;
+  assert.match(entry.detail ?? '', /nonsense/);
+  assert.equal(entry.endpoint, '/v1/responses');
 });
 
 test('upstream failures surface with the OpenAI error shape', async (t) => {

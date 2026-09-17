@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   DEFAULT_SYSTEM_PROMPT,
   chatRequestSchema,
+  ignoredRequestFields,
   mapThinkingToReasoningEffort,
   normalizeMessages,
   normalizeOpenAiRequestBody,
@@ -62,18 +63,34 @@ test('max_completion_tokens becomes upstream max_tokens and reasoning is mapped'
   assert.equal(mapThinkingToReasoningEffort({ type: 'adaptive' }, 'medium'), 'medium');
 });
 
-test('a strict request schema rejects unknown fields', () => {
-  assert.throws(() => parse({ model: 'm', messages: [{ role: 'user', content: 'x' }], n: 2 }));
+test('unknown fields are stripped instead of rejected', () => {
+  // A newer OpenAI field, or a provider-specific extra, must not cost the
+  // client its whole turn.
+  const parsed = parse({
+    model: 'm',
+    messages: [{ role: 'user', content: 'x' }],
+    n: 2,
+    response_format: { type: 'json_object' },
+    prompt_cache_key: 'abc',
+  });
+  assert.deepEqual(Object.keys(parsed).sort(), ['messages', 'model', 'stream']);
+  assert.deepEqual(ignoredRequestFields({ model: 'm', messages: [], prompt_cache_key: 'a' }), [
+    'prompt_cache_key',
+  ]);
+
   assert.throws(() => parse({ model: 'm', messages: [] }));
+  assert.throws(() => parse({ model: '', messages: [{ role: 'user', content: 'x' }] }));
 });
 
 test('"[undefined]" placeholders from loose clients are dropped', () => {
   const body = normalizeOpenAiRequestBody({
     model: 'm',
     temperature: '[undefined]',
-    stream_options: { include_usage: '[undefined]' },
+    // Not in any allow-list: the placeholder is dropped by value, not by name.
+    prompt_cache_key: '[undefined]',
+    stream_options: { include_usage: '[undefined]', other: 1 },
   });
-  assert.deepEqual(body, { model: 'm', stream_options: {} });
+  assert.deepEqual(body, { model: 'm', stream_options: { other: 1 } });
 });
 
 test('streaming chunks drop upstream shell fields', () => {

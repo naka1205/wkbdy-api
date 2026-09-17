@@ -105,23 +105,51 @@ test('stream_options.include_usage adds a usage-only final chunk', async (t) => 
   assert.deepEqual(usageChunk.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
 });
 
-test('unsupported and contradictory parameters are rejected before the upstream is called', async (t) => {
+test('parameters the gateway does not model are ignored, not rejected', async (t) => {
   const context = await fixture(t);
-  const unsupported = await post(context, { model: 'deepseek-v4.1-flash', messages, n: 2 });
-  assert.equal(unsupported.statusCode, 400);
-  assert.equal(unsupported.json<{ error: { code: string } }>().error.code, 'unsupported_parameter');
+  const response = await post(context, {
+    model: 'deepseek-v4.1-flash',
+    messages,
+    n: 2,
+    prompt_cache_key: 'cache-me',
+    response_format: { type: 'json_object' },
+  });
+  assert.equal(response.statusCode, 200);
+  const sent = context.upstream.last!;
+  assert.equal(sent.body.n, undefined);
+  assert.equal(sent.body.response_format, undefined);
+  assert.equal(sent.body.prompt_cache_key, undefined);
 
-  const contradictory = await post(context, {
+  // The log row still explains what was dropped.
+  const entry = context.store.logs().entries[0]!;
+  assert.match(entry.detail ?? '', /prompt_cache_key/);
+  assert.match(entry.detail ?? '', /response_format/);
+  assert.equal(entry.endpoint, '/v1/chat/completions');
+});
+
+test('max_tokens wins when a client sends both token limits', async (t) => {
+  const context = await fixture(t);
+  const response = await post(context, {
     model: 'deepseek-v4.1-flash',
     messages,
     max_tokens: 5,
-    max_completion_tokens: 5,
+    max_completion_tokens: 9,
   });
-  assert.equal(contradictory.statusCode, 400);
-  assert.equal(context.upstream.calls.length, 0);
+  assert.equal(response.statusCode, 200);
+  assert.equal(context.upstream.last!.body.max_tokens, 5);
+  assert.match(context.store.logs().entries[0]!.detail ?? '', /max_completion_tokens/);
+});
 
+test('a structurally invalid request is rejected with a field-level message', async (t) => {
+  const context = await fixture(t);
   const invalid = await post(context, { model: '', messages });
   assert.equal(invalid.statusCode, 400);
+  assert.equal(context.upstream.calls.length, 0);
+  assert.equal(context.store.logs().entries[0]!.status, 400);
+
+  const noMessages = await post(context, { model: 'deepseek-v4.1-flash', messages: [] });
+  assert.equal(noMessages.statusCode, 400);
+  assert.match(String(context.store.logs().entries[0]!.detail), /messages must contain at least one message/);
 });
 
 test('unknown models return 404 model_not_found', async (t) => {

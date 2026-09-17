@@ -12,7 +12,7 @@ import { mapUpstreamError, reportQuotaFailure } from '../proxy.js';
 import type { IssuedCredential, UpstreamChunk, WorkBuddyClient } from '../upstream.js';
 import { resolvedContextWindow } from '../models.js';
 import type { Accounts } from '../accounts.js';
-import { requestRecorder } from '../logging.js';
+import { requestRecorder, type RequestOutcome } from '../logging.js';
 import {
   applyCorrelation,
   correlationHeaders,
@@ -49,17 +49,38 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       stream: body.stream === true,
     };
     const record = requestRecorder(opts.store, req, info);
+    const notes: string[] = [];
+    let note: string | null = null;
+    const finish = (outcome: RequestOutcome) => record({ detail: note, ...outcome });
     let correlation: ClientIdentifiers;
     try {
       correlation = resolveCorrelation(req, req.id);
       info.correlation = correlation;
       applyCorrelation(reply, correlation);
     } catch (error) {
-      record({ status: 400, error: error instanceof AppError ? error.code : 'invalid_correlation_id' });
+      finish({
+        status: 400,
+        error: error instanceof AppError ? error.code : 'invalid_correlation_id',
+        detail: error instanceof Error ? error.message : undefined,
+      });
       throw error;
     }
+
+    // Unknown top-level fields are ignored rather than rejected; see proxy.ts.
+    const ignoredFields = Object.keys(body).filter((key) => !(key in responsesRequestSchema.shape));
+    if (ignoredFields.length) {
+      notes.push(`ignored unsupported parameters: ${ignoredFields.join(', ')}`);
+      req.log.warn({ ignored: ignoredFields }, 'ignored unsupported responses parameters');
+    }
+    note = notes.length ? notes.join('; ') : null;
+
     const fail = (error: ReturnType<typeof openAiError>) => {
-      record({ status: error.statusCode, error: error.body.error.code });
+      const message: string = error.body.error.message;
+      finish({
+        status: error.statusCode,
+        error: error.body.error.code,
+        detail: note ? `${note}; ${message}` : message,
+      });
       return reply.code(error.statusCode).send(error.body);
     };
 
@@ -133,7 +154,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       if (!request.stream) {
         for await (const chunk of opened.stream) builder.push(chunk);
         const response = builder.build(responseOptions(request));
-        record({
+        finish({
           status: 200,
           accountId: credential.accountId,
           credits: builder.credits,
@@ -276,7 +297,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
         if (item) writeEvent('response.output_item.done', { output_index: outputIndex, item });
       }
       writeEvent('response.completed', { response });
-      record({
+      finish({
         status: 200,
         accountId: credential.accountId,
         credits: builder.credits,
@@ -286,7 +307,11 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     } catch (error) {
       reportQuotaFailure(opts.accounts, error);
       const mapped = mapUpstreamError(error);
-      record({ status: abort.signal.aborted ? 499 : mapped.statusCode, error: mapped.body.error.code });
+      finish({
+        status: abort.signal.aborted ? 499 : mapped.statusCode,
+        error: mapped.body.error.code,
+        detail: mapped.body.error.message,
+      });
       if (!reply.raw.headersSent) return reply.code(mapped.statusCode).send(mapped.body);
       if (!reply.raw.destroyed && !abort.signal.aborted) {
         reply.raw.write(

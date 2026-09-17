@@ -106,6 +106,10 @@ export interface RequestLogEntry {
   /** Trace ID the upstream echoed back for this call. */
   upstreamRequestId?: string | null;
   error: string | null;
+  /** Why the request failed, or what the gateway ignored while accepting it. */
+  detail?: string | null;
+  /** Path the client called, e.g. /v1/chat/completions. */
+  endpoint?: string | null;
 }
 
 export interface LogQuery {
@@ -822,8 +826,8 @@ export class Store {
         `INSERT INTO request_logs (request_id,timestamp,api_key_id,api_key_name,model,account_id,stream,status,
            duration_ms,input_tokens,output_tokens,total_tokens,credits,
            task_id,session_id,trace_id,client_request_id,logical_request_id,client_attempt,upstream_request_id,
-           error)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           error,endpoint,detail)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         entry.requestId,
@@ -847,6 +851,8 @@ export class Store {
         entry.clientAttempt ?? null,
         entry.upstreamRequestId ?? null,
         entry.error,
+        entry.endpoint ?? null,
+        entry.detail ?? null,
       );
     this.events.emit('log', entry);
   }
@@ -908,6 +914,8 @@ export class Store {
         clientAttempt: row.client_attempt ?? null,
         upstreamRequestId: row.upstream_request_id ?? null,
         error: row.error ?? null,
+        detail: row.detail ?? null,
+        endpoint: row.endpoint ?? null,
       })),
     };
   }

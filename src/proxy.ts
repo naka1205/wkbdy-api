@@ -1,5 +1,10 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
-import { chatRequestSchema, normalizeOpenAiRequestBody, toUpstreamRequest } from './request.js';
+import {
+  chatRequestSchema,
+  ignoredRequestFields,
+  normalizeOpenAiRequestBody,
+  toUpstreamRequest,
+} from './request.js';
 import {
   UpstreamHttpError,
   UpstreamProtocolError,
@@ -20,28 +25,6 @@ import {
 } from './correlation.js';
 import type { Store } from './store.js';
 
-/** Fields that would silently change semantics if dropped; reject instead. */
-const REJECTED_UNSUPPORTED = new Set([
-  'logprobs',
-  'top_logprobs',
-  'response_format',
-  'seed',
-  'presence_penalty',
-  'frequency_penalty',
-  'n',
-  'store',
-  'metadata',
-  'logit_bias',
-  'functions',
-  'function_call',
-  'audio',
-  'modalities',
-  'prediction',
-  'web_search_options',
-  'service_tier',
-  'speed',
-]);
-
 interface ChatOpts {
   store: Store;
   accounts: Accounts;
@@ -58,37 +41,48 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       stream: streaming,
     };
     const record = requestRecorder(opts.store, req, info);
+    // Notes collected while accepting the request; they end up in the log row
+    // even when the call succeeds, so a silently dropped parameter is visible.
+    const notes: string[] = [];
+    let note: string | null = null;
+    const finish = (outcome: RequestOutcome) => record({ detail: note, ...outcome });
     let correlation: ClientIdentifiers;
     try {
       correlation = resolveCorrelation(req, req.id);
       info.correlation = correlation;
       applyCorrelation(reply, correlation);
     } catch (error) {
-      record({ status: 400, error: error instanceof AppError ? error.code : 'invalid_correlation_id' });
+      finish({
+        status: 400,
+        error: error instanceof AppError ? error.code : 'invalid_correlation_id',
+        detail: error instanceof Error ? error.message : undefined,
+      });
       throw error;
     }
-    const fail = (error: ReturnType<typeof openAiError>, accountId?: string) => {
-      record({ status: error.statusCode, accountId, error: error.body.error.code });
-      return reply.code(error.statusCode).send(error.body);
-    };
 
-    for (const key of Object.keys(body)) {
-      if (REJECTED_UNSUPPORTED.has(key)) {
-        return fail(
-          openAiError(
-            400,
-            'unsupported_parameter',
-            `Parameter '${key}' is not supported by this gateway.`,
-            key,
-          ),
-        );
-      }
+    // Tolerate parameters this gateway does not model. A client that ships a
+    // newer OpenAI field, or a provider-specific extra, must not lose a whole
+    // agent turn to a 400: the schema strips it and we record the fact.
+    const ignored = ignoredRequestFields(body);
+    if (ignored.length) {
+      notes.push(`ignored unsupported parameters: ${ignored.join(', ')}`);
+      req.log.warn({ ignored }, 'ignored unsupported chat parameters');
     }
     if (body.max_tokens !== undefined && body.max_completion_tokens !== undefined) {
-      return fail(
-        openAiError(400, 'invalid_request', 'max_tokens and max_completion_tokens are mutually exclusive.'),
-      );
+      notes.push('both max_tokens and max_completion_tokens were sent; max_tokens wins');
     }
+    note = notes.length ? notes.join('; ') : null;
+
+    const fail = (error: ReturnType<typeof openAiError>, accountId?: string) => {
+      const message: string = error.body.error.message;
+      finish({
+        status: error.statusCode,
+        accountId,
+        error: error.body.error.code,
+        detail: note ? `${note}; ${message}` : message,
+      });
+      return reply.code(error.statusCode).send(error.body);
+    };
     const parsed = chatRequestSchema.safeParse(body);
     if (!parsed.success) {
       const first = parsed.error.issues[0];
@@ -133,7 +127,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         const built = aggregator.build(request.model);
         const usage = built.usage;
         opts.accounts.reportSuccess(credential, usage?.total_tokens ?? 0);
-        record({
+        finish({
           status: 200,
           accountId: credential.accountId,
           inputTokens: usage?.prompt_tokens,
@@ -144,7 +138,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         return built;
       } catch (error) {
         reportQuotaFailure(opts.accounts, error);
-        return sendUpstreamError(reply, error, record);
+        return sendUpstreamError(reply, error, finish);
       }
     }
 
@@ -157,10 +151,11 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       usage?: { prompt_tokens?: number; completion_tokens?: number },
       error?: string,
       credits?: number,
+      detail?: string,
     ) => {
       if (settled) return;
       settled = true;
-      record({
+      finish({
         status,
         accountId: credential?.accountId,
         inputTokens: usage?.prompt_tokens,
@@ -168,6 +163,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         credits,
         upstreamRequestId,
         error,
+        detail,
       });
     };
     // Status is committed below; upstream errors after that point become SSE error frames.
@@ -231,10 +227,10 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       reportQuotaFailure(opts.accounts, error);
       const mapped = mapUpstreamError(error);
       if (!reply.raw.headersSent) {
-        settle(mapped.statusCode, undefined, mapped.body.error.code);
+        settle(mapped.statusCode, undefined, mapped.body.error.code, undefined, mapped.body.error.message);
         return reply.code(mapped.statusCode).send(mapped.body);
       }
-      settle(mapped.statusCode, undefined, mapped.body.error.code);
+      settle(mapped.statusCode, undefined, mapped.body.error.code, undefined, mapped.body.error.message);
       if (!reply.raw.destroyed && !abort.signal.aborted) {
         reply.raw.write(`data: ${JSON.stringify({ error: mapped.body.error })}\n\n`);
         reply.raw.end();
@@ -253,6 +249,7 @@ function sendUpstreamError(
   record({
     status: mapped.statusCode,
     error: mapped.body.error.code,
+    detail: mapped.body.error.message,
     ...(mapped.upstreamRequestId ? { upstreamRequestId: mapped.upstreamRequestId } : {}),
   });
   if (mapped.retryAfter !== undefined) reply.header('Retry-After', String(mapped.retryAfter));

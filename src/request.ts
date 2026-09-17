@@ -4,10 +4,10 @@ export const reasoningEffortSchema = z.enum(['none', 'minimal', 'low', 'medium',
 
 export const thinkingSchema = z.union([
   reasoningEffortSchema,
-  z.object({ type: z.literal('adaptive') }).strict(),
-  z.object({ type: z.literal('disabled') }).strict(),
-  z.object({ type: z.literal('enabled'), budget_tokens: z.number().int().positive().optional() }).strict(),
-  z.object({ effort: reasoningEffortSchema }).strict(),
+  z.object({ type: z.literal('adaptive') }),
+  z.object({ type: z.literal('disabled') }),
+  z.object({ type: z.literal('enabled'), budget_tokens: z.number().int().positive().optional() }),
+  z.object({ effort: reasoningEffortSchema }),
 ]);
 
 export type ReasoningEffort = z.infer<typeof reasoningEffortSchema>;
@@ -31,103 +31,89 @@ export function mapThinkingToReasoningEffort(
         : 'low';
 }
 
+/** Some clients serialise absent optional fields as this literal string. */
+const UNDEFINED_PLACEHOLDER = '[undefined]';
+
+/**
+ * Drop the "[undefined]" placeholders loose clients send (they would otherwise
+ * fail validation), without touching real values.
+ */
 export function normalizeOpenAiRequestBody(body: unknown): unknown {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
-  const out = { ...(body as Record<string, unknown>) };
-  const optionalKeys = [
-    'user',
-    'max_tokens',
-    'max_completion_tokens',
-    'temperature',
-    'top_p',
-    'stop',
-    'thinking',
-    'reasoning_effort',
-    'response_format',
-    'frequency_penalty',
-    'presence_penalty',
-    'seed',
-    'service_tier',
-    'serviceTier',
-    'verbosity',
-    'tools',
-    'tool_choice',
-    'parallel_tool_calls',
-    'stream_options',
-    'metadata',
-    'logprobs',
-    'top_logprobs',
-    'web_search_options',
-    'store',
-    'logit_bias',
-    'functions',
-    'function_call',
-    'audio',
-    'modalities',
-    'prediction',
-    'speed',
-  ];
-  for (const key of optionalKeys) if (out[key] === '[undefined]') delete out[key];
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+    if (value === UNDEFINED_PLACEHOLDER) continue;
+    out[key] = value;
+  }
   if (out.stream_options && typeof out.stream_options === 'object' && !Array.isArray(out.stream_options)) {
     const streamOptions = { ...(out.stream_options as Record<string, unknown>) };
-    if (streamOptions.include_usage === '[undefined]') delete streamOptions.include_usage;
+    if (streamOptions.include_usage === UNDEFINED_PLACEHOLDER) delete streamOptions.include_usage;
     out.stream_options = streamOptions;
   }
   return out;
 }
 
 /**
- * Downstream (OpenAI) chat request schema. Only the fields the first version
- * supports are declared; unknown-but-semantics-changing fields are rejected
- * explicitly in the route (strict passthrough policy per plan).
+ * Parameters a client may send but this gateway does not model. They are
+ * ignored (and recorded on the log row) instead of failing the request: a
+ * client that ships a newer OpenAI field, or a provider-specific extra, must
+ * not lose a whole agent turn to a 400. See docs/client-api.md.
  */
-export const chatRequestSchema = z
-  .object({
-    model: z.string().min(1),
-    messages: z
-      .array(
-        z.object({
-          role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
-          content: z.union([z.string(), z.array(z.any())]).optional(),
-          name: z.string().optional(),
-          tool_calls: z.array(z.any()).optional(),
-          tool_call_id: z.string().optional(),
+export function ignoredRequestFields(body: Record<string, unknown>): string[] {
+  const known = new Set(Object.keys(chatRequestSchema.shape));
+  return Object.keys(body).filter((key) => !known.has(key));
+}
+
+/**
+ * Downstream (OpenAI) chat request schema. Fields this gateway understands are
+ * declared; anything else is stripped by zod and reported by the route, which
+ * keeps unknown client parameters from breaking a call.
+ */
+export const chatRequestSchema = z.object({
+  model: z.string().min(1),
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
+        content: z.union([z.string(), z.array(z.any())]).optional(),
+        name: z.string().optional(),
+        tool_calls: z.array(z.any()).optional(),
+        tool_call_id: z.string().optional(),
+      }),
+    )
+    .min(1, 'messages must contain at least one message'),
+  stream: z.boolean().default(false),
+  temperature: z.number().min(0).max(2).optional(),
+  top_p: z.number().min(0).max(1).optional(),
+  max_tokens: z.number().int().positive().optional(),
+  max_completion_tokens: z.number().int().positive().optional(),
+  stop: z.union([z.string(), z.array(z.string()).max(4)]).optional(),
+  tools: z
+    .array(
+      z.object({
+        type: z.literal('function'),
+        function: z.object({
+          name: z.string().min(1),
+          description: z.string().optional(),
+          parameters: z.record(z.any()).optional(),
         }),
-      )
-      .min(1, 'messages must contain at least one message'),
-    stream: z.boolean().default(false),
-    temperature: z.number().min(0).max(2).optional(),
-    top_p: z.number().min(0).max(1).optional(),
-    max_tokens: z.number().int().positive().optional(),
-    max_completion_tokens: z.number().int().positive().optional(),
-    stop: z.union([z.string(), z.array(z.string()).max(4)]).optional(),
-    tools: z
-      .array(
-        z.object({
-          type: z.literal('function'),
-          function: z.object({
-            name: z.string().min(1),
-            description: z.string().optional(),
-            parameters: z.record(z.any()).optional(),
-          }),
-        }),
-      )
-      .optional(),
-    tool_choice: z
-      .union([
-        z.enum(['none', 'auto', 'required']),
-        z.object({ type: z.literal('function'), function: z.object({ name: z.string() }) }),
-      ])
-      .optional(),
-    parallel_tool_calls: z.boolean().optional(),
-    // Both OpenAI-style strings and common object forms map to WorkBuddy's top-level reasoning_effort.
-    reasoning_effort: reasoningEffortSchema.optional(),
-    thinking: thinkingSchema.optional(),
-    context_window: z.number().int().positive().optional(),
-    user: z.string().optional(),
-    stream_options: z.object({ include_usage: z.boolean().optional() }).optional(),
-  })
-  .strict();
+      }),
+    )
+    .optional(),
+  tool_choice: z
+    .union([
+      z.enum(['none', 'auto', 'required']),
+      z.object({ type: z.literal('function'), function: z.object({ name: z.string() }) }),
+    ])
+    .optional(),
+  parallel_tool_calls: z.boolean().optional(),
+  // Both OpenAI-style strings and common object forms map to WorkBuddy's top-level reasoning_effort.
+  reasoning_effort: reasoningEffortSchema.optional(),
+  thinking: thinkingSchema.optional(),
+  context_window: z.number().int().positive().optional(),
+  user: z.string().optional(),
+  stream_options: z.object({ include_usage: z.boolean().optional() }).optional(),
+});
 
 export type ChatRequest = z.infer<typeof chatRequestSchema>;
 

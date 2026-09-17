@@ -64,7 +64,9 @@
 
 ## 请求日志
 
-每次调用记录：请求 ID、时间、密钥、模型、账号、是否流式、状态码、耗时、输入/输出 Token、上游 credit 计费值、错误码。
+每次调用记录：请求 ID、时间、密钥、模型、账号、端点、是否流式、状态码、耗时、输入/输出 Token、上游 credit 计费值、错误码与详细信息。
+
+`detail` 是给排障用的自然语言说明：失败时是校验或上游的原始消息（例如 `messages: messages must contain at least one message`），成功时是被忽略的客户端参数列表。面板「请求日志」详情里可以直接看到，列表里的错误码也有悬停提示。
 
 `credits` 取自上游 `usage.credit`（WorkBuddy 自己的计费单位，与 Token 用量无关，免费账号为 0），只写入日志与统计（`stats.credits24h`），不会出现在返回给客户端的 `usage` 里。
 

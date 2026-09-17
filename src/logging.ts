@@ -12,6 +12,8 @@ export type RequestOutcome = {
   /** Trace ID the upstream echoed back for this call. */
   upstreamRequestId?: string;
   error?: string;
+  /** Human-readable explanation for the panel (validation or upstream message). */
+  detail?: string | null;
 };
 
 /**
@@ -40,6 +42,7 @@ export function requestRecorder(
       apiKeyId: request.apiKeyId ?? null,
       apiKeyName: request.apiKeyName ?? null,
       model: info.model,
+      endpoint: request.url,
       accountId: outcome.accountId ?? null,
       stream: info.stream,
       status: outcome.status,
@@ -56,6 +59,7 @@ export function requestRecorder(
       clientAttempt: correlation?.clientAttempt ?? null,
       upstreamRequestId: outcome.upstreamRequestId ?? null,
       error: outcome.error ?? null,
+      detail: outcome.detail ?? null,
     });
   };
 }
