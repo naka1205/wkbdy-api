@@ -13,6 +13,7 @@ import { openDatabase } from './db.js';
 import { AppError, errorMessage, redactError } from './errors.js';
 import { Jobs } from './jobs.js';
 import { OAuthBroker } from './oauth.js';
+import { createDumpSink, dumpHeaders } from './dump.js';
 import { openAiError } from './openai/errors.js';
 import { adminRoutes, syncCatalog } from './routes/admin.js';
 import { modelsRoutes } from './routes/models.js';
@@ -79,6 +80,8 @@ export async function createServer(options: CreateServerOptions = {}) {
     }
   }
 
+  const dump = createDumpSink(env.dumpDir, { redact: env.dumpRedact });
+
   const app = Fastify({
     logger:
       env.logLevel === 'silent'
@@ -94,6 +97,24 @@ export async function createServer(options: CreateServerOptions = {}) {
   });
   app.decorateRequest('apiKeyId', null);
   app.decorateRequest('apiKeyName', null);
+  app.decorateRequest('rawBody', null);
+
+  // While dumping, keep the exact bytes the client sent (the JSON parser would
+  // drop key order and whitespace). Enabled only when a dump directory is set.
+  if (dump.enabled) {
+    app.addContentTypeParser('application/json', { parseAs: 'string' }, (request, body, done) => {
+      (request as { rawBody?: string | null }).rawBody = body as string;
+      try {
+        done(null, JSON.parse(body as string));
+      } catch {
+        const error = Object.assign(new Error('Body is not valid JSON'), {
+          statusCode: 400,
+          code: 'FST_ERR_CTP_INVALID_JSON_BODY',
+        });
+        done(error as Error);
+      }
+    });
+  }
 
   const auth = new Auth(store, env.adminPassword, new URL(env.publicBaseUrl).protocol === 'https:');
   const accounts = new Accounts(store, () => store.settings().pool.cooldownSeconds * 1000);
@@ -101,6 +122,7 @@ export async function createServer(options: CreateServerOptions = {}) {
     upstreamUrl: () => store.settings().upstream.url,
     userAgent: () => store.settings().upstream.userAgent,
     credentials: accounts,
+    dump,
     ...(options.fetcher ? { fetchFn: options.fetcher } : {}),
   });
   const oauth = new OAuthBroker({
@@ -132,7 +154,32 @@ export async function createServer(options: CreateServerOptions = {}) {
   // auth hook writes before a route runs, so a client can always correlate.
   app.addHook('onSend', async (request, reply, payload) => {
     reply.header('X-Request-Id', request.id);
+    if (dump.enabled && request.url.startsWith('/v1/')) {
+      dump.write('client_response', {
+        requestId: request.id,
+        status: reply.statusCode,
+        headers: dumpHeaders(reply.getHeaders()),
+        body: typeof payload === 'string' ? payload : undefined,
+        payloadType: typeof payload,
+      });
+    }
     return payload;
+  });
+
+  // Record the client side of every gateway call while dumping. Admin traffic
+  // is excluded on purpose: it carries the admin password and session cookies.
+  app.addHook('preHandler', async (request) => {
+    if (!dump.enabled) return;
+    const path = request.url.split('?')[0]!;
+    if (!path.startsWith('/v1/')) return;
+    dump.write('client_request', {
+      requestId: request.id,
+      method: request.method,
+      url: request.url,
+      apiKeyName: request.apiKeyName ?? null,
+      headers: dumpHeaders(request.headers),
+      body: (request as { rawBody?: string | null }).rawBody ?? request.body,
+    });
   });
 
   // Downstream authentication for every /v1 route.
@@ -223,8 +270,8 @@ export async function createServer(options: CreateServerOptions = {}) {
   });
 
   await app.register(modelsRoutes, { prefix: '/v1', store });
-  await app.register(chatCompletionsRoutes, { prefix: '/v1', store, accounts, client });
-  await app.register(responsesRoutes, { prefix: '/v1', store, accounts, client });
+  await app.register(chatCompletionsRoutes, { prefix: '/v1', store, accounts, client, dump });
+  await app.register(responsesRoutes, { prefix: '/v1', store, accounts, client, dump });
   await app.register(adminRoutes, {
     prefix: '/api/admin',
     auth,
@@ -290,9 +337,13 @@ export async function createServer(options: CreateServerOptions = {}) {
     db.close();
   });
 
+  if (dump.enabled) {
+    app.log.warn({ file: dump.file }, 'protocol dump enabled: raw traffic is being recorded');
+  }
+
   if (options.jobs !== false) jobs.start();
 
-  return { app, store, accounts, client, oauth, jobs, auth, env, version };
+  return { app, store, accounts, client, oauth, jobs, auth, env, version, dump };
 }
 
 function openAiCodeFor(status: number, error: Error) {

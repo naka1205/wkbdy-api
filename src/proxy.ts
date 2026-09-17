@@ -24,11 +24,14 @@ import {
   type ClientIdentifiers,
 } from './correlation.js';
 import type { Store } from './store.js';
+import type { DumpSink } from './dump.js';
 
 interface ChatOpts {
   store: Store;
   accounts: Accounts;
   client: WorkBuddyClient;
+  /** Protocol recorder; disabled unless WKB2API_DUMP_DIR is set. */
+  dump?: DumpSink;
 }
 
 export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): void {
@@ -166,6 +169,12 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         detail,
       });
     };
+    // Record the exact frames the client receives, so a client-side framing
+    // problem can be told apart from an upstream one.
+    const send = (frame: string) => {
+      opts.dump?.write('client_sse', { requestId: req.id, text: frame });
+      reply.raw.write(frame);
+    };
     // Status is committed below; upstream errors after that point become SSE error frames.
     try {
       const opened = await opts.client.streamChatCompletion(upstreamBody, abort.signal, {
@@ -198,11 +207,11 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
             };
           }
           const converted = toOpenAiChunk({ ...chunk, usage: null }, meta);
-          if (converted) reply.raw.write(`data: ${JSON.stringify(converted)}\n\n`);
+          if (converted) send(`data: ${JSON.stringify(converted)}\n\n`);
           continue;
         }
         const converted = toOpenAiChunk(chunk, meta);
-        if (converted) reply.raw.write(`data: ${JSON.stringify(converted)}\n\n`);
+        if (converted) send(`data: ${JSON.stringify(converted)}\n\n`);
       }
       if (pendingUsage) {
         opts.accounts.reportSuccess(credential, pendingUsage.total_tokens);
@@ -221,7 +230,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         opts.accounts.reportSuccess(credential, 0);
         settle(200, undefined, undefined, credits);
       }
-      reply.raw.write('data: [DONE]\n\n');
+      send('data: [DONE]\n\n');
       reply.raw.end();
     } catch (error) {
       reportQuotaFailure(opts.accounts, error);
@@ -232,7 +241,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       }
       settle(mapped.statusCode, undefined, mapped.body.error.code, undefined, mapped.body.error.message);
       if (!reply.raw.destroyed && !abort.signal.aborted) {
-        reply.raw.write(`data: ${JSON.stringify({ error: mapped.body.error })}\n\n`);
+        send(`data: ${JSON.stringify({ error: mapped.body.error })}\n\n`);
         reply.raw.end();
       }
     }

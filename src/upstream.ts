@@ -2,6 +2,7 @@ import { SseParser } from './stream.js';
 import type { UpstreamChatRequest } from './request.js';
 import { randomUUID } from 'node:crypto';
 import type { WorkBuddyCredential } from './credentials.js';
+import { dumpHeaders, type DumpSink } from './dump.js';
 
 /** One normalized upstream chunk event, post-SSE parsing. */
 export type UpstreamChunk = {
@@ -39,6 +40,8 @@ export type ClientOptions = {
   credentials: CredentialLike;
   userAgent: string | (() => string);
   fetchFn?: typeof fetch;
+  /** Protocol recorder; a no-op unless WKB2API_DUMP_DIR is set. */
+  dump?: DumpSink;
 };
 
 /**
@@ -119,6 +122,10 @@ export class WorkBuddyClient {
     this.fetchFn = opts.fetchFn ?? fetch;
   }
 
+  private get dump(): DumpSink | undefined {
+    return this.opts.dump?.enabled ? this.opts.dump : undefined;
+  }
+
   private get url(): string {
     return typeof this.opts.upstreamUrl === 'function' ? this.opts.upstreamUrl() : this.opts.upstreamUrl;
   }
@@ -147,6 +154,7 @@ export class WorkBuddyClient {
     const { apiKeyId, allowAuthRetry = true, requireDone = false, requestId } = options;
     let credential = await this.opts.credentials.getCredential(apiKeyId);
     let res = await this.send(body, signal, credential, requestId);
+    this.dumpResponse(res, credential, requestId, 'attempt-1');
     if (res.status === 401 && allowAuthRetry) {
       await res.body?.cancel().catch(() => {});
       if (this.opts.credentials.refreshRejectedCredential) {
@@ -160,12 +168,20 @@ export class WorkBuddyClient {
         credential = await this.opts.credentials.getCredential(apiKeyId);
       }
       res = await this.send(body, signal, credential, requestId);
+      this.dumpResponse(res, credential, requestId, 'attempt-2');
     }
     if (res.status === 401 || res.status === 403) this.opts.credentials.reportFailure?.(credential);
     else if (res.status >= 500 || res.status === 429)
       this.reportTransient(credential, `upstream ${res.status}`);
     if (res.status !== 200 || !res.body) {
       const text = await res.text().catch(() => '');
+      this.dump?.write('upstream_error_body', {
+        requestId,
+        accountId: credential.accountId,
+        status: res.status,
+        retryAfter: res.headers.get('retry-after') ?? undefined,
+        body: text,
+      });
       const parsed = safeJson(text);
       throw new UpstreamHttpError(
         res.status,
@@ -180,7 +196,10 @@ export class WorkBuddyClient {
     const upstreamRequestId = res.headers.get('x-request-id') ?? undefined;
     return {
       credential,
-      stream: this.parseStream(res.body, signal, requireDone),
+      stream: this.parseStream(res.body, signal, requireDone, {
+        requestId,
+        accountId: credential.accountId,
+      }),
       ...(upstreamRequestId ? { upstreamRequestId } : {}),
     };
   }
@@ -212,10 +231,24 @@ export class WorkBuddyClient {
       stream: true,
       max_tokens: 5,
     };
+    const payload = JSON.stringify(body);
+    this.dump?.write('upstream_request', {
+      kind: 'credential-verification',
+      url: this.url,
+      method: 'POST',
+      headers: dumpHeaders(headers),
+      body: payload,
+    });
     const res = await this.fetchFn(this.url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: payload,
+    });
+    this.dump?.write('upstream_response', {
+      kind: 'credential-verification',
+      status: res.status,
+      statusText: res.statusText,
+      headers: dumpHeaders(res.headers),
     });
     // Consume/discard whatever came back so the socket is released.
     await res.body?.cancel().catch(() => {});
@@ -248,6 +281,23 @@ export class WorkBuddyClient {
     }
   }
 
+  /** Record the upstream status line and headers of one attempt. */
+  private dumpResponse(
+    res: Response,
+    cred: WorkBuddyCredential,
+    requestId: string | undefined,
+    phase: string,
+  ): void {
+    this.dump?.write('upstream_response', {
+      requestId,
+      phase,
+      accountId: (cred as IssuedCredential).accountId,
+      status: res.status,
+      statusText: res.statusText,
+      headers: dumpHeaders(res.headers),
+    });
+  }
+
   private reportTransient(cred: WorkBuddyCredential, message: string): void {
     const accountId = (cred as IssuedCredential).accountId;
     this.opts.credentials.reportTransientFailure?.(accountId, message);
@@ -271,10 +321,19 @@ export class WorkBuddyClient {
     // The upstream echoes this header back (and reports it in error bodies),
     // which makes the two sides of one call traceable with a single ID.
     if (requestId) headers['X-Request-ID'] = requestId;
+    const payload = JSON.stringify(body);
+    this.dump?.write('upstream_request', {
+      requestId,
+      accountId: (cred as IssuedCredential).accountId,
+      url: this.url,
+      method: 'POST',
+      headers: dumpHeaders(headers),
+      body: payload,
+    });
     return this.fetchFn(this.url, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: payload,
       signal,
     });
   }
@@ -284,6 +343,7 @@ export class WorkBuddyClient {
     body: ReadableStream<Uint8Array>,
     signal: AbortSignal,
     requireDone = false,
+    context: { requestId?: string; accountId?: string } = {},
   ): StreamResult {
     const reader = body.getReader();
     const onAbort = () => {
@@ -298,7 +358,15 @@ export class WorkBuddyClient {
         signal.throwIfAborted();
         const { done: streamDone, value } = await reader.read();
         if (streamDone) break;
-        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+        const text = decoder.decode(value, { stream: true });
+        // Raw upstream bytes: the exact SSE text, before any parsing.
+        this.dump?.write('upstream_chunk', {
+          requestId: context.requestId,
+          accountId: context.accountId,
+          bytes: value.byteLength,
+          text,
+        });
+        for (const frame of parser.push(text)) {
           if (frame.kind === 'done') {
             done = true;
             break;

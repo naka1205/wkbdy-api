@@ -8,6 +8,8 @@ data/*
 # The admin bundle is built in wkbdy-api-admin and copied here by deploy:assets.
 static/*
 !static/.gitkeep
+# Protocol dumps from WKB2API_DUMP_DIR contain live credentials.
+dump/
 coverage/
 reports/
 *.log

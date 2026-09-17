@@ -24,6 +24,8 @@
 | `WKB2API_CATALOG_PATH`     | 否     | `./config/wb_v3config.public.json`             | 产品目录文件；首次启动导入数据库，之后用于 `models/sync`          |
 | `WKB2API_CREDENTIALS_PATH` | 否     | 空                                             | 本机 WorkBuddy 凭据文件；设置后才启用“导入本机账号”               |
 | `TOKEN_ENCRYPTION_KEY`     | 否     | 空                                             | base64 编码的 32 字节密钥；不设置时使用 `DATA_DIR/encryption.key` |
+| `WKB2API_DUMP_DIR`         | 否     | 空                                             | 协议抓包目录；设置后把客户端/上游的**原始**报文写入 JSONL（见下） |
+| `WKB2API_DUMP_REDACT`      | 否     | 空                                             | 设为 `1` 时把 `Bearer …`／JWT／`sk-…` 替换成占位符                |
 
 `.env` 缺失或不可读不会导致启动失败，但 `ADMIN_PASSWORD` 为空会立即报错：
 
@@ -31,6 +33,26 @@
 Invalid configuration:
   ADMIN_PASSWORD: Set ADMIN_PASSWORD to at least 8 characters in .env
 ```
+
+### 协议抓包（临时排障）
+
+设置 `WKB2API_DUMP_DIR` 后，网关会把每次 `/v1/*` 调用的原始数据追加写入 `<DIR>/dump-YYYY-MM-DD.jsonl`，一行一个事件：
+
+| kind                  | 内容                                                                        |
+| --------------------- | --------------------------------------------------------------------------- |
+| `client_request`      | 客户端方法、URL、**原始请求头**、**原始请求体字节**（未经 JSON 重新序列化） |
+| `client_response`     | 网关返回给客户端的状态码、响应头与响应体                                    |
+| `upstream_request`    | 发给 WorkBuddy 的 URL、请求头（含账号令牌）与请求体                         |
+| `upstream_response`   | 上游状态行与响应头                                                          |
+| `upstream_chunk`      | 上游 SSE 的**原始文本分片**（逐字节读取时的每一段）                         |
+| `upstream_error_body` | 上游非 200 时的原始响应体                                                   |
+
+注意：
+
+- 默认**不脱敏、不截断**，因此文件里包含客户端密钥与上游账号令牌，按凭证对待，排障结束就删除。
+- 管理端（`/api/admin/*`）的请求不会记录，因为其中包含管理员密码与会话 Cookie。
+- 流式响应由 `client_sse` 逐帧记录（hijack 后的响应不经过 `onSend`，因此没有 `client_response`）；非流式响应记 `client_response`。
+- 仅在需要抓包时临时打开；不设置该变量时没有任何开销，也不会改变 JSON 解析行为。
 
 ## 运行时设置
 

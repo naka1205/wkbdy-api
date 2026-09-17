@@ -85,6 +85,7 @@ export function testEnv(overrides: Partial<EnvConfig> = {}): EnvConfig {
     catalogPath: CATALOG_PATH,
     apiKeys: [API_KEY],
     logLevel: 'silent',
+    dumpRedact: false,
     ...overrides,
   };
 }

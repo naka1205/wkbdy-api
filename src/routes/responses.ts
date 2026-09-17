@@ -20,11 +20,14 @@ import {
   type ClientIdentifiers,
 } from '../correlation.js';
 import type { Store } from '../store.js';
+import type { DumpSink } from '../dump.js';
 
 type ResponsesOptions = {
   store: Store;
   accounts: Accounts;
   client: WorkBuddyClient;
+  /** Protocol recorder; disabled unless WKB2API_DUMP_DIR is set. */
+  dump?: DumpSink;
 };
 
 function responseOptions(request: ReturnType<typeof responsesRequestSchema.parse>) {
@@ -178,7 +181,9 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       let sequence = 0;
       const writeEvent = (type: string, event: Record<string, unknown>) => {
         const payload = { type, sequence_number: sequence++, ...event };
-        reply.raw.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);
+        const frame = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+        opts.dump?.write('client_sse', { requestId: req.id, text: frame });
+        reply.raw.write(frame);
       };
       const created = {
         id: builder.responseId,

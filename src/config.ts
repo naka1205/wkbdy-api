@@ -67,6 +67,10 @@ export interface EnvConfig {
   apiKeys: string[];
   credentialsPath?: string;
   logLevel: 'fatal' | 'error' | 'warn' | 'info' | 'debug' | 'silent';
+  /** When set, raw client/upstream traffic is appended to a JSONL file here. */
+  dumpDir?: string;
+  /** Store credential-shaped strings as placeholders instead of verbatim. */
+  dumpRedact?: boolean;
 }
 
 export function loadEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
@@ -96,5 +100,7 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
       .filter(Boolean),
     credentialsPath: env.WKB2API_CREDENTIALS_PATH || undefined,
     logLevel: raw.LOG_LEVEL,
+    ...(env.WKB2API_DUMP_DIR ? { dumpDir: resolve(env.WKB2API_DUMP_DIR) } : {}),
+    dumpRedact: env.WKB2API_DUMP_REDACT === '1' || env.WKB2API_DUMP_REDACT === 'true',
   };
 }

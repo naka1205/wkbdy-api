@@ -98,7 +98,18 @@ export function isRateLimited(error: unknown): boolean {
   );
 }
 
-/** Strip credentials, tokens and control characters from any message an operator can read. */
+/**
+ * Strip credential-shaped substrings without changing the rest of the text.
+ * Used by the protocol recorder, which must keep full request/response bodies
+ * (unlike `redactError`, which is for short messages and truncates).
+ */
+export function redactCredentials(text: string): string {
+  return text
+    .replace(/Bearer\s+[^\s"'<>]+/gi, 'Bearer [redacted]')
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[redacted token]')
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, '[redacted key]');
+}
+
 export function redactError(message: string, secrets: readonly string[] = []): string {
   let safe = message;
   const values = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
@@ -111,9 +122,7 @@ export function redactError(message: string, secrets: readonly string[] = []): s
     }
     for (const variant of variants) safe = safe.replaceAll(variant, '[redacted]');
   }
-  return safe
-    .replace(/Bearer\s+[^\s"<]+/gi, 'Bearer [redacted]')
-    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[redacted token]')
+  return redactCredentials(safe)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
     .slice(0, 400);
 }
