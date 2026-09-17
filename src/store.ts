@@ -51,6 +51,10 @@ export interface Account {
   consecutiveFailures: number;
   requests: number;
   tokens: number;
+  /** Credits the upstream charged for this account's requests. */
+  credits: number;
+  /** Set when the upstream reported this account out of credits. */
+  quotaExhaustedAt: number | null;
   lastError: string | null;
   lastUsedAt: number | null;
   createdAt: string;
@@ -94,6 +98,10 @@ export interface RequestLogEntry {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** Prompt tokens served from the upstream prompt cache; 0 when unknown. */
+  cacheHitTokens?: number;
+  /** Reasoning tokens billed inside outputTokens; 0 when unknown. */
+  reasoningTokens?: number;
   /** Credits the upstream charged (WorkBuddy `usage.credit`); 0 when unknown. */
   credits?: number;
   /** Correlation IDs sent by the client (see docs/retry-policy.md). */
@@ -143,6 +151,8 @@ function toAccount(row: AccountRow): Account {
     consecutiveFailures: row.consecutive_failures ?? 0,
     requests: row.requests ?? 0,
     tokens: row.tokens ?? 0,
+    credits: row.credits ?? 0,
+    quotaExhaustedAt: row.quota_exhausted_at ?? null,
     lastError: row.last_error ?? null,
     lastUsedAt: row.last_used_at ?? null,
     createdAt: row.created_at,
@@ -265,7 +275,7 @@ export class Store {
           `UPDATE accounts SET access_token=?, refresh_token=?, token_hash=?, user_id=?, domain=?,
              oauth_origin=COALESCE(NULLIF(?,''), oauth_origin),
              source=?, expires_at=?, refresh_expires_at=?, enabled=1, needs_reauth=0, quarantined_until=0,
-             consecutive_failures=0, last_error=NULL,
+             consecutive_failures=0, last_error=NULL, quota_exhausted_at=NULL,
              email=COALESCE(NULLIF(?,''), email),
              name=CASE WHEN ? <> '' THEN ? ELSE name END,
              note=CASE WHEN ? <> '' THEN ? ELSE note END
@@ -332,7 +342,9 @@ export class Store {
       sets.push('enabled=?');
       values.push(parsed.enabled ? 1 : 0);
       if (parsed.enabled) {
-        sets.push('quarantined_until=0', 'consecutive_failures=0');
+        // Re-enabling is an operator statement that the account is usable
+        // again, so clear the "out of credits" flag too.
+        sets.push('quarantined_until=0', 'consecutive_failures=0', 'quota_exhausted_at=NULL');
       }
     }
     if (!sets.length) return this.account(id);
@@ -388,16 +400,38 @@ export class Store {
     })();
   }
 
-  markUsed(id: string, tokens = 0): void {
+  markUsed(id: string, tokens = 0, credits = 0): void {
     this.db
-      .prepare('UPDATE accounts SET last_used_at=?, requests=requests+1, tokens=tokens+? WHERE id=?')
-      .run(Date.now(), tokens, id);
+      .prepare(
+        'UPDATE accounts SET last_used_at=?, requests=requests+1, tokens=tokens+?, credits=credits+? WHERE id=?',
+      )
+      .run(Date.now(), tokens, credits, id);
   }
 
   reportSuccess(id: string): void {
     this.db
-      .prepare('UPDATE accounts SET consecutive_failures=0, quarantined_until=0, last_error=NULL WHERE id=?')
+      .prepare(
+        `UPDATE accounts SET consecutive_failures=0, quarantined_until=0, last_error=NULL,
+           quota_exhausted_at=NULL WHERE id=?`,
+      )
       .run(id);
+  }
+
+  /** Out of credits: quarantine as usual and flag it for the panel. */
+  markQuotaExhausted(id: string, cooldownMs: number, error?: string): void {
+    this.reportFailure(id, cooldownMs, error ?? 'Upstream quota or balance is exhausted.');
+    this.db.prepare('UPDATE accounts SET quota_exhausted_at=? WHERE id=?').run(Date.now(), id);
+  }
+
+  /**
+   * Upstream risk control blocked this account. It cannot recover by waiting,
+   * so it leaves the rotation until an operator re-enables it.
+   */
+  disableAccount(id: string, error?: string): void {
+    this.db
+      .prepare('UPDATE accounts SET enabled=0, last_error=? WHERE id=?')
+      .run((error ?? 'Upstream blocked this account.').slice(0, 300), id);
+    this.releaseBindingForAccount(id);
   }
 
   reportFailure(id: string, cooldownMs: number, error?: string): void {
@@ -824,10 +858,10 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO request_logs (request_id,timestamp,api_key_id,api_key_name,model,account_id,stream,status,
-           duration_ms,input_tokens,output_tokens,total_tokens,credits,
+           duration_ms,input_tokens,output_tokens,total_tokens,cache_hit_tokens,reasoning_tokens,credits,
            task_id,session_id,trace_id,client_request_id,logical_request_id,client_attempt,upstream_request_id,
            error,endpoint,detail)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         entry.requestId,
@@ -842,6 +876,8 @@ export class Store {
         entry.inputTokens,
         entry.outputTokens,
         entry.totalTokens,
+        entry.cacheHitTokens ?? 0,
+        entry.reasoningTokens ?? 0,
         entry.credits ?? 0,
         entry.taskId ?? null,
         entry.sessionId ?? null,
@@ -905,6 +941,8 @@ export class Store {
         inputTokens: row.input_tokens,
         outputTokens: row.output_tokens,
         totalTokens: row.total_tokens,
+        cacheHitTokens: row.cache_hit_tokens ?? 0,
+        reasoningTokens: row.reasoning_tokens ?? 0,
         credits: row.credits ?? 0,
         taskId: row.task_id ?? null,
         sessionId: row.session_id ?? null,
@@ -925,6 +963,8 @@ export class Store {
     errors24h: number;
     tokens24h: number;
     credits24h: number;
+    /** Prompt tokens served from the upstream cache in the last 24h. */
+    cacheHitTokens24h: number;
     perModel: Array<{ model: string; requests: number; tokens: number }>;
     latency: { p50: number | null; p95: number | null };
     daily: Array<{ date: string; requests: number; tokens: number }>;
@@ -933,10 +973,17 @@ export class Store {
     const totals = this.db
       .prepare(
         `SELECT COUNT(*) AS requests, SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors,
-                COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(credits), 0) AS credits
+                COALESCE(SUM(total_tokens), 0) AS tokens, COALESCE(SUM(credits), 0) AS credits,
+                COALESCE(SUM(cache_hit_tokens), 0) AS cache_hits
          FROM request_logs WHERE timestamp >= ?`,
       )
-      .get(since) as { requests: number; errors: number | null; tokens: number; credits: number };
+      .get(since) as {
+      requests: number;
+      errors: number | null;
+      tokens: number;
+      credits: number;
+      cache_hits: number;
+    };
     const perModel = this.db
       .prepare(
         `SELECT model, COUNT(*) AS requests, COALESCE(SUM(total_tokens),0) AS tokens
@@ -968,6 +1015,7 @@ export class Store {
       errors24h: totals.errors ?? 0,
       tokens24h: totals.tokens,
       credits24h: totals.credits,
+      cacheHitTokens24h: totals.cache_hits,
       perModel,
       latency: { p50: percentile(0.5), p95: percentile(0.95) },
       daily,

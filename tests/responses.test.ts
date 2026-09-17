@@ -14,7 +14,13 @@ test('a non-streaming Responses request returns a completed response object', as
     status: string;
     model: string;
     output: Array<{ type: string; content: Array<{ type: string; text: string }> }>;
-    usage: { input_tokens: number; output_tokens: number; total_tokens: number };
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      total_tokens: number;
+      input_tokens_details: { cached_tokens: number };
+      output_tokens_details: { reasoning_tokens: number };
+    };
   }>();
   assert.equal(body.object, 'response');
   assert.equal(body.status, 'completed');
@@ -22,8 +28,18 @@ test('a non-streaming Responses request returns a completed response object', as
   assert.equal(body.output[0]!.type, 'message');
   assert.equal(body.output[0]!.content[0]!.text, '你好');
   assert.deepEqual(
-    { input_tokens: body.usage.input_tokens, output_tokens: body.usage.output_tokens },
-    { input_tokens: 10, output_tokens: 4 },
+    {
+      input_tokens: body.usage.input_tokens,
+      output_tokens: body.usage.output_tokens,
+      input_tokens_details: body.usage.input_tokens_details,
+      output_tokens_details: body.usage.output_tokens_details,
+    },
+    {
+      input_tokens: 10,
+      output_tokens: 4,
+      input_tokens_details: { cached_tokens: 8 },
+      output_tokens_details: { reasoning_tokens: 3 },
+    },
   );
 
   assert.deepEqual(context.upstream.last!.body.messages[0], {
@@ -64,6 +80,25 @@ test('a streaming Responses request emits the documented event sequence', async 
   assert.match(response.body, /"sequence_number":/);
 });
 
+test('a Responses call is counted against the account, credits included', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () =>
+    sse(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'hi' } }] })}\n\n` +
+        `data: ${JSON.stringify({
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 12, completion_tokens: 3, total_tokens: 15, credit: 2.5 },
+        })}\n\n` +
+        'data: [DONE]\n\n',
+    );
+  const response = await post(context, { model: 'deepseek-v4.1-flash', input: 'x' });
+  assert.equal(response.statusCode, 200);
+  const account = context.store.accounts()[0]!;
+  assert.equal(account.requests, 1);
+  assert.equal(account.tokens, 15);
+  assert.equal(account.credits, 2.5);
+});
+
 test('invalid Responses bodies and unknown models are rejected', async (t) => {
   const context = await fixture(t);
   assert.equal((await post(context, { model: 'deepseek-v4.1-flash' })).statusCode, 400);
@@ -92,6 +127,41 @@ test('upstream failures surface with the OpenAI error shape', async (t) => {
   assert.equal(response.statusCode, 429);
   assert.equal(response.json<{ error: { code: string } }>().error.code, 'upstream_error');
   assert.equal(context.store.logs().entries[0]!.status, 429);
+});
+
+test('a quota failure on the only account still carries the retry contract', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () => json({ error: { data: { code: 14018, msg: 'Credits exhausted' } } }, 429);
+  const response = await post(context, { model: 'deepseek-v4.1-flash', input: 'x' });
+  assert.equal(response.statusCode, 429);
+  const body = response.json<{ error: { code: string; retryable?: boolean; retry_after?: number } }>();
+  assert.equal(body.error.code, 'insufficient_quota');
+  assert.equal(response.headers['retry-after'], '1');
+  assert.equal(body.error.retryable, true);
+  assert.equal(body.error.retry_after, 1);
+});
+
+test('an exhausted account is swapped out for a Responses call too', async (t) => {
+  const context = await fixture(t);
+  context.store.upsertAccount({
+    name: 'spare account',
+    note: '',
+    source: 'manual',
+    accessToken: 'spare-access-token',
+    refreshToken: '',
+    userId: 'user-2',
+    domain: 'www.workbuddy.ai',
+  });
+  context.upstream.handler = (call) =>
+    call.headers.get('x-user-id') === 'user-1'
+      ? json({ error: { data: { code: 14018, msg: 'Credits exhausted' } } }, 429)
+      : sse(streamPayload);
+  const response = await post(context, { model: 'deepseek-v4.1-flash', input: 'x' });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(
+    context.upstream.calls.map((call) => call.headers.get('x-user-id')),
+    ['user-1', 'user-2'],
+  );
 });
 
 test('a byte-split upstream stream still produces a full response', async (t) => {

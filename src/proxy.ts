@@ -10,12 +10,25 @@ import {
   UpstreamProtocolError,
   type WorkBuddyClient,
   type IssuedCredential,
+  type UpstreamStream,
+  type UpstreamUsage,
 } from './upstream.js';
-import { CompletionAggregator, localCompletionId, toOpenAiChunk } from './openai/response-builder.js';
+import {
+  CompletionAggregator,
+  localCompletionId,
+  toOpenAiChunk,
+  toOpenAiUsage,
+} from './openai/response-builder.js';
 import { openAiError } from './openai/errors.js';
 import { resolvedContextWindow, type StoredModel } from './models.js';
 import type { Accounts } from './accounts.js';
-import { AppError, CredentialError, NoAvailableAccountsError, isQuotaFailure } from './errors.js';
+import {
+  AppError,
+  CredentialError,
+  NoAvailableAccountsError,
+  isAccountBlocked,
+  isQuotaFailure,
+} from './errors.js';
 import { requestRecorder, type RequestOutcome } from './logging.js';
 import {
   applyCorrelation,
@@ -119,7 +132,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     let credential: IssuedCredential | undefined;
     if (!request.stream) {
       try {
-        const opened = await opts.client.streamChatCompletion(upstreamBody, abort.signal, {
+        const opened = await openUpstream(opts.client, opts.accounts, upstreamBody, abort.signal, {
           apiKeyId: req.apiKeyId ?? undefined,
           requestId: correlation.logicalRequestId,
         });
@@ -129,18 +142,20 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         for await (const chunk of stream) aggregator.push(chunk);
         const built = aggregator.build(request.model);
         const usage = built.usage;
-        opts.accounts.reportSuccess(credential, usage?.total_tokens ?? 0);
+        opts.accounts.reportSuccess(credential, usage?.total_tokens ?? 0, aggregator.credits);
         finish({
           status: 200,
           accountId: credential.accountId,
           inputTokens: usage?.prompt_tokens,
           outputTokens: usage?.completion_tokens,
+          cacheHitTokens: usage?.prompt_tokens_details.cached_tokens,
+          reasoningTokens: usage?.completion_tokens_details.reasoning_tokens,
           credits: aggregator.credits,
           upstreamRequestId,
         });
         return built;
       } catch (error) {
-        reportQuotaFailure(opts.accounts, error);
+        reportAccountFailure(opts.accounts, error);
         return sendUpstreamError(reply, error, finish);
       }
     }
@@ -151,7 +166,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     let upstreamRequestId: string | undefined;
     const settle = (
       status: number,
-      usage?: { prompt_tokens?: number; completion_tokens?: number },
+      usage?: UpstreamUsage,
       error?: string,
       credits?: number,
       detail?: string,
@@ -163,6 +178,8 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         accountId: credential?.accountId,
         inputTokens: usage?.prompt_tokens,
         outputTokens: usage?.completion_tokens,
+        cacheHitTokens: usage?.cached_tokens,
+        reasoningTokens: usage?.reasoning_tokens,
         credits,
         upstreamRequestId,
         error,
@@ -177,7 +194,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     };
     // Status is committed below; upstream errors after that point become SSE error frames.
     try {
-      const opened = await opts.client.streamChatCompletion(upstreamBody, abort.signal, {
+      const opened = await openUpstream(opts.client, opts.accounts, upstreamBody, abort.signal, {
         apiKeyId: req.apiKeyId ?? undefined,
         requestId: correlation.logicalRequestId,
       });
@@ -191,21 +208,14 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         'X-Accel-Buffering': 'no',
       });
       const includeUsage = request.stream_options?.include_usage === true;
-      let pendingUsage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null =
-        null;
+      let pendingUsage: UpstreamUsage | null = null;
       let credits: number | undefined;
       for await (const chunk of opened.stream) {
         // The usage-bearing frame is the finish frame; always forward its
         // finish_reason/delta, but hold the usage block for the optional chunk.
         if (chunk.usage) {
           if (typeof chunk.usage.credit === 'number') credits = chunk.usage.credit;
-          if (includeUsage) {
-            pendingUsage = {
-              prompt_tokens: chunk.usage.prompt_tokens ?? 0,
-              completion_tokens: chunk.usage.completion_tokens ?? 0,
-              total_tokens: chunk.usage.total_tokens ?? 0,
-            };
-          }
+          if (includeUsage) pendingUsage = chunk.usage;
           const converted = toOpenAiChunk({ ...chunk, usage: null }, meta);
           if (converted) send(`data: ${JSON.stringify(converted)}\n\n`);
           continue;
@@ -214,7 +224,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         if (converted) send(`data: ${JSON.stringify(converted)}\n\n`);
       }
       if (pendingUsage) {
-        opts.accounts.reportSuccess(credential, pendingUsage.total_tokens);
+        opts.accounts.reportSuccess(credential, pendingUsage.total_tokens ?? 0, credits ?? 0);
         settle(200, pendingUsage, undefined, credits);
         reply.raw.write(
           `data: ${JSON.stringify({
@@ -223,7 +233,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
             created: meta.created,
             model: meta.model,
             choices: [],
-            usage: pendingUsage,
+            usage: toOpenAiUsage(pendingUsage),
           })}\n\n`,
         );
       } else {
@@ -233,7 +243,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       send('data: [DONE]\n\n');
       reply.raw.end();
     } catch (error) {
-      reportQuotaFailure(opts.accounts, error);
+      reportAccountFailure(opts.accounts, error);
       const mapped = mapUpstreamError(error);
       if (!reply.raw.headersSent) {
         settle(mapped.statusCode, undefined, mapped.body.error.code, undefined, mapped.body.error.message);
@@ -261,23 +271,88 @@ function sendUpstreamError(
     detail: mapped.body.error.message,
     ...(mapped.upstreamRequestId ? { upstreamRequestId: mapped.upstreamRequestId } : {}),
   });
-  if (mapped.retryAfter !== undefined) reply.header('Retry-After', String(mapped.retryAfter));
-  const body =
-    mapped.retryAfter === undefined
-      ? mapped.body
-      : { error: { ...mapped.body.error, retry_after: mapped.retryAfter } };
-  return reply.code(mapped.statusCode).send(body);
+  applyRetryAfter(reply, mapped);
+  return reply.code(mapped.statusCode).send(upstreamErrorPayload(mapped));
 }
 
 /**
- * An account that ran out of quota must leave the rotation, otherwise a pinned
- * client would keep retrying the same exhausted account forever.
+ * Retry contract shared by every endpoint: a retryable failure carries
+ * `Retry-After` **and** `error.retryable` / `error.retry_after`, because
+ * clients disagree on which one they read (see docs/retry-policy.md).
  */
-export function reportQuotaFailure(accounts: Accounts, error: unknown): void {
-  if (!(error instanceof UpstreamHttpError)) return;
-  if (!isQuotaFailure(error.status, error.code, error.upstreamMessage)) return;
-  if (!error.accountId) return;
-  accounts.reportFailureById(error.accountId, 'Upstream quota or balance is exhausted.');
+export function applyRetryAfter(reply: FastifyReply, mapped: MappedError): void {
+  if (mapped.retryAfter !== undefined) reply.header('Retry-After', String(mapped.retryAfter));
+}
+
+export function upstreamErrorPayload(mapped: MappedError): unknown {
+  if (mapped.retryAfter === undefined) return mapped.body;
+  return {
+    error: { ...mapped.body.error, retryable: true, retry_after: mapped.retryAfter },
+  };
+}
+
+/** Upper bound on how many accounts one client call may burn through. */
+const ACCOUNT_FAILOVER_LIMIT = 3;
+
+/**
+ * Account-scoped failures mean *this* account cannot serve the call, not that
+ * the client did anything wrong: quota exhaustion, rejected credentials or a
+ * blocked account. The pool retires the account and the same client call is
+ * retried on the next one, so a single dead account no longer kills a task.
+ */
+function isAccountScopedFailure(error: unknown): error is UpstreamHttpError & { accountId: string } {
+  if (!(error instanceof UpstreamHttpError) || !error.accountId) return false;
+  if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) return true;
+  if (isAccountBlocked(error.code, error.upstreamMessage)) return true;
+  return error.status === 401 || error.status === 402 || error.status === 403;
+}
+
+export async function openUpstream(
+  client: WorkBuddyClient,
+  accounts: Accounts,
+  body: Parameters<WorkBuddyClient['streamChatCompletion']>[0],
+  signal: AbortSignal,
+  options: Parameters<WorkBuddyClient['streamChatCompletion']>[2],
+): Promise<UpstreamStream> {
+  let accountError: unknown;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.streamChatCompletion(body, signal, options);
+    } catch (error) {
+      if (signal.aborted) throw error;
+      // The pool went dry while looking for a replacement: report why the
+      // first account failed instead of a bare "no account available".
+      if (error instanceof NoAvailableAccountsError && accountError) throw accountError;
+      if (attempt >= ACCOUNT_FAILOVER_LIMIT || !isAccountScopedFailure(error)) throw error;
+      accountError = error;
+      // Retiring releases the sticky binding, so the next attempt picks
+      // another account rather than hammering the one that just failed.
+      if (isAccountBlocked(error.code, error.upstreamMessage)) {
+        accounts.reportBlocked(error.accountId, error.upstreamMessage);
+      } else if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
+        accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.');
+      } else {
+        accounts.reportFailureById(error.accountId, 'Upstream rejected this account; switching.');
+      }
+    }
+  }
+}
+
+/**
+ * Account-scoped upstream failures must leave the rotation, otherwise a pinned
+ * client would keep retrying the same dead account forever. Quota exhaustion is
+ * only quarantined (the account may be topped up); a risk-control block
+ * disables the account outright because waiting cannot fix it.
+ */
+export function reportAccountFailure(accounts: Accounts, error: unknown): void {
+  if (!(error instanceof UpstreamHttpError) || !error.accountId) return;
+  if (isAccountBlocked(error.code, error.upstreamMessage)) {
+    accounts.reportBlocked(error.accountId, error.upstreamMessage);
+    return;
+  }
+  if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
+    accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.');
+  }
 }
 
 export type MappedError = ReturnType<typeof openAiError> & {
@@ -339,6 +414,14 @@ export function mapUpstreamError(error: unknown): MappedError {
 }
 
 function mapHttpStatus(error: UpstreamHttpError): ReturnType<typeof openAiError> {
+  if (isAccountBlocked(error.code, error.upstreamMessage)) {
+    // The account is disabled, so a retry lands on another one.
+    return openAiError(
+      429,
+      'upstream_error',
+      'Upstream restricted this account; it was disabled and the request can be retried.',
+    );
+  }
   if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
     return openAiError(429, 'insufficient_quota', 'Upstream quota or balance is exhausted.');
   }

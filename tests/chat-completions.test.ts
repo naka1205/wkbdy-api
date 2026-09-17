@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULT_CONTEXT_WINDOW } from '../src/models.js';
-import { json, sse, streamPayload, fixture, type Fixture } from './helpers.js';
+import { json, sse, streamPayload, streamUsage, fixture, type Fixture } from './helpers.js';
 
 const messages = [{ role: 'user', content: 'hi' }];
 const post = (context: Fixture, payload: Record<string, unknown>) =>
@@ -17,7 +17,7 @@ test('a non-streaming request is aggregated from the upstream stream', async (t)
   }>();
   assert.equal(body.choices[0]!.message.content, '你好');
   assert.equal(body.choices[0]!.finish_reason, 'stop');
-  assert.deepEqual(body.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
+  assert.deepEqual(body.usage, streamUsage);
 
   const sent = context.upstream.last!;
   assert.equal(sent.body.stream, true);
@@ -32,6 +32,10 @@ test('a non-streaming request is aggregated from the upstream stream', async (t)
   assert.equal(logged.total, 1);
   assert.equal(logged.entries[0]!.status, 200);
   assert.equal(logged.entries[0]!.totalTokens, 14);
+  // Prompt-cache and reasoning telemetry survives to the panel as well.
+  assert.equal(logged.entries[0]!.cacheHitTokens, 8);
+  assert.equal(logged.entries[0]!.reasoningTokens, 3);
+  assert.equal(context.store.stats().cacheHitTokens24h, 8);
   assert.equal(logged.entries[0]!.apiKeyName, 'Initial key 1');
   assert.equal(logged.entries[0]!.accountId, context.store.accounts()[0]!.id);
   assert.equal(context.store.accounts()[0]!.requests, 1);
@@ -51,9 +55,18 @@ test('upstream credits are logged but never exposed to clients', async (t) => {
 
   const buffered = await post(context, { model: 'deepseek-v4.1-flash', messages });
   const body = buffered.json<{ usage: Record<string, unknown> }>();
-  assert.deepEqual(body.usage, { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10 });
+  assert.deepEqual(body.usage, {
+    prompt_tokens: 8,
+    completion_tokens: 2,
+    total_tokens: 10,
+    prompt_tokens_details: { cached_tokens: 0 },
+    completion_tokens_details: { reasoning_tokens: 0 },
+  });
   assert.equal(context.store.logs().entries[0]!.credits, 3);
   assert.equal(context.store.stats().credits24h, 3);
+  // The account list shows consumption too, not just the per-request log.
+  assert.equal(context.store.accounts()[0]!.credits, 3);
+  assert.equal(context.store.accounts()[0]!.tokens, 10);
 
   const streamed = await post(context, {
     model: 'deepseek-v4.1-flash',
@@ -67,8 +80,16 @@ test('upstream credits are logged but never exposed to clients', async (t) => {
     .filter((frame: string) => frame.startsWith('data: ') && !frame.includes('[DONE]'))
     .map((frame: string) => JSON.parse(frame.slice(6)));
   const usageChunk = frames.at(-1);
-  assert.deepEqual(usageChunk.usage, { prompt_tokens: 8, completion_tokens: 2, total_tokens: 10 });
+  assert.deepEqual(usageChunk.usage, {
+    prompt_tokens: 8,
+    completion_tokens: 2,
+    total_tokens: 10,
+    prompt_tokens_details: { cached_tokens: 0 },
+    completion_tokens_details: { reasoning_tokens: 0 },
+  });
   assert.equal(context.store.logs().entries[0]!.credits, 3);
+  assert.equal(context.store.accounts()[0]!.credits, 6);
+  assert.equal(context.store.accounts()[0]!.requests, 2);
 });
 
 test('a streaming request forwards OpenAI chunks and terminates with [DONE]', async (t) => {
@@ -102,7 +123,7 @@ test('stream_options.include_usage adds a usage-only final chunk', async (t) => 
     .map((frame: string) => JSON.parse(frame.slice(6)));
   const usageChunk = payloads.at(-1);
   assert.deepEqual(usageChunk.choices, []);
-  assert.deepEqual(usageChunk.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
+  assert.deepEqual(usageChunk.usage, streamUsage);
 });
 
 test('parameters the gateway does not model are ignored, not rejected', async (t) => {
@@ -211,6 +232,72 @@ test('upstream rate limits and quota failures keep their meaning', async (t) => 
   assert.equal(quota.json<{ error: { code: string } }>().error.code, 'insufficient_quota');
   // An exhausted account leaves the rotation so the next retry can pick another.
   assert.equal(context.store.availability().available, 0);
+});
+
+test('an exhausted account is swapped out mid-request, so the task survives', async (t) => {
+  const context = await fixture(t);
+  context.store.upsertAccount({
+    name: 'spare account',
+    note: '',
+    source: 'manual',
+    accessToken: 'spare-access-token',
+    refreshToken: '',
+    userId: 'user-2',
+    domain: 'www.workbuddy.ai',
+  });
+  const quota = { code: 14018, msg: 'Credits exhausted. Please buy more credits.' };
+  context.upstream.handler = (call) =>
+    call.headers.get('x-user-id') === 'user-1' ? json({ error: { data: quota } }, 429) : sse(streamPayload);
+
+  const response = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    response.json<{ choices: Array<{ message: { content: string } }> }>().choices[0]!.message.content,
+    '你好',
+  );
+  // One attempt per account: the exhausted one is retired, the spare serves the call.
+  assert.deepEqual(
+    context.upstream.calls.map((call) => call.headers.get('x-user-id')),
+    ['user-1', 'user-2'],
+  );
+  const retired = context.store.accounts().find((account) => account.userId === 'user-1')!;
+  assert.ok(retired.quarantinedUntil > Date.now());
+  assert.equal(context.store.availability().available, 1);
+});
+
+test('the original account error surfaces when no spare account is left', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () => json({ code: 402, msg: '账户余额不足' }, 402);
+  const response = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(response.statusCode, 429);
+  const body = response.json<{ error: { code: string; retryable?: boolean; retry_after?: number } }>();
+  assert.equal(body.error.code, 'insufficient_quota');
+  assert.equal(response.headers['retry-after'], '1');
+  assert.equal(body.error.retryable, true);
+  assert.equal(body.error.retry_after, 1);
+});
+
+test('a risk-control block disables the account instead of retrying it', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () =>
+    json({ error: { data: { code: 410004, msg: '账号已被封控，请联系客服' } } }, 403);
+  const response = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.headers['retry-after'], '1');
+  const account = context.store.accounts()[0]!;
+  assert.equal(account.enabled, false);
+  assert.equal(account.quotaExhaustedAt, null);
+  assert.equal(context.store.availability().available, 0);
+  assert.equal(context.upstream.calls.length, 1);
+});
+
+test('nested WorkBuddy error codes survive and flag quota exhaustion', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () => json({ error: { data: { code: 14018, msg: 'Credits exhausted.' } } }, 429);
+  const response = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(response.statusCode, 429);
+  assert.equal(response.json<{ error: { code: string } }>().error.code, 'insufficient_quota');
+  assert.ok(context.store.accounts()[0]!.quotaExhaustedAt !== null);
 });
 
 test('transient upstream failures are retryable and carry a retry hint', async (t) => {

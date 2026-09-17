@@ -36,9 +36,9 @@
 | 隔离期结束或任意成功请求          | 计数清零，恢复调度                                                       |
 | Token 临近过期（提前 60 秒判定）  | 请求前刷新；`jobs` 定时任务也会提前刷新                                  |
 
-调度不使用跨账号重试：一个客户端请求只会打到被选中的账号上（唯一的例外是 401 后的同账号刷新重试）。占号只影响「下一次请求选谁」，不会让同一次请求换号重发。
+上游封控（`410004` 或「账号已被封控」类消息）会**直接把账号停用**并释放占号——这类失败等待不会恢复，需要在面板里人工重新启用；账号级失败（额度耗尽、令牌被上游拒绝、账号被封）会在**同一次客户端请求内换号重试**，最多 3 个账号：占号账号不能用时自动退役并释放占号，请求落到下一个可用账号，客户端不会因为池里某一个账号没额度而中断任务。池内确实没有可用账号时，回的是第一个失败账号的错误（例如 `insufficient_quota`）而不是笼统的「无可用账号」。请求级失败（参数、模型、上游 4xx）不换号。
 
-对客户端而言，可重试的失败统一返回 429 + `Retry-After`，可重试的判定、关联请求头与日志字段见[重试与关联 ID](retry-policy.md)。
+对客户端而言，可重试的失败统一返回 429 + `Retry-After`，错误体同时带 `error.retryable` 与 `error.retry_after`；`/v1/chat/completions` 与 `/v1/responses`（含流式错误帧）行为一致。可重试的判定、关联请求头与日志字段见[重试与关联 ID](retry-policy.md)。
 
 ## 模型目录
 
@@ -68,7 +68,9 @@
 
 `detail` 是给排障用的自然语言说明：失败时是校验或上游的原始消息（例如 `messages: messages must contain at least one message`），成功时是被忽略的客户端参数列表。面板「请求日志」详情里可以直接看到，列表里的错误码也有悬停提示。
 
-`credits` 取自上游 `usage.credit`（WorkBuddy 自己的计费单位，与 Token 用量无关，免费账号为 0），只写入日志与统计（`stats.credits24h`），不会出现在返回给客户端的 `usage` 里。
+`cache_hit_tokens` / `reasoning_tokens` 取自上游 usage（`prompt_cache_hit_tokens`/`prompt_tokens_details.cached_tokens` 与 `completion_thinking_tokens`/`completion_tokens_details.reasoning_tokens`），面板详情可见；统计接口额外给出 `stats.cacheHitTokens24h`，控制台用它显示缓存命中率。
+
+`credits` 取自上游 `usage.credit`（WorkBuddy 自己的计费单位，与 Token 用量无关，免费账号为 0），只写入日志与统计（`stats.credits24h`），不会出现在返回给客户端的 `usage` 里。同一个值也按账号累加到 `accounts.credits`，账号列表直接显示每个账号的累计积分消耗（上游说该账号额度耗尽时 `quota_exhausted_at` 会被写入，面板把数字显示成红色，成功一次即清除）；`/v1/chat/completions` 与 `/v1/responses` 都会累加请求数、Token 与积分（Responses 走的是 Codex 流量，早先漏记，现已在成功、非流式与流式两条路径都补上）。
 
 - 关联字段：客户端提交的 `task_id`、`session_id`、`trace_id`、`client_request_id`、`logical_request_id`、`client_attempt`，以及上游回显的 `upstream_request_id`；请求头契约见[重试与关联 ID](retry-policy.md)。
 - 保留策略：`logging.retentionDays`（默认 30 天）与 `logging.maxEntries`（默认 50000 条），由定时任务清理。

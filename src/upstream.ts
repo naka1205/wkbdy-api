@@ -28,6 +28,10 @@ export type UpstreamUsage = {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  /** Prompt tokens served from the upstream prompt cache. */
+  cached_tokens?: number;
+  /** Hidden reasoning tokens billed inside completion_tokens. */
+  reasoning_tokens?: number;
   /** WorkBuddy extension: credits charged for this request. */
   credit?: number;
 };
@@ -182,14 +186,15 @@ export class WorkBuddyClient {
         retryAfter: res.headers.get('retry-after') ?? undefined,
         body: text,
       });
-      const parsed = safeJson(text);
+      const parsedBody = safeJson(text);
+      const fields = errorFields(parsedBody);
       throw new UpstreamHttpError(
         res.status,
-        parsed?.code !== undefined ? String(parsed.code) : undefined,
-        typeof parsed?.msg === 'string' ? parsed.msg : text.slice(0, 500),
+        fields.code,
+        fields.message ?? text.slice(0, 500),
         res.headers.get('retry-after') ?? undefined,
         res.headers.get('x-request-id') ??
-          (typeof parsed?.requestId === 'string' ? parsed.requestId : undefined),
+          (typeof parsedBody?.requestId === 'string' ? parsedBody.requestId : undefined),
         credential.accountId,
       );
     }
@@ -254,12 +259,8 @@ export class WorkBuddyClient {
     await res.body?.cancel().catch(() => {});
     if (res.status === 200) return;
     const text = await res.text().catch(() => '');
-    const parsed = safeJson(text);
-    throw new UpstreamHttpError(
-      res.status,
-      parsed?.code !== undefined ? String(parsed.code) : undefined,
-      typeof parsed?.msg === 'string' ? parsed.msg : text.slice(0, 300),
-    );
+    const fields = errorFields(safeJson(text));
+    throw new UpstreamHttpError(res.status, fields.code, fields.message ?? text.slice(0, 300));
   }
 
   /**
@@ -391,6 +392,19 @@ export class WorkBuddyClient {
           if (frame.kind === 'comment') continue;
           const chunk = safeJson(frame.json);
           if (chunk === null) throw new UpstreamProtocolError('upstream sent a non-JSON trailing frame');
+          // Risk-control and quota failures can also arrive as an error frame
+          // after the HTTP status was already committed as 200.
+          if (chunk.error) {
+            const fields = errorFields(chunk);
+            throw new UpstreamHttpError(
+              502,
+              fields.code,
+              fields.message ?? 'Upstream aborted the stream.',
+              undefined,
+              typeof chunk.requestId === 'string' ? chunk.requestId : undefined,
+              context.accountId,
+            );
+          }
           yield normalizeChunk(chunk);
         }
       }
@@ -427,9 +441,61 @@ function normalizeChunk(raw: unknown): UpstreamChunk {
             prompt_tokens: obj.usage.prompt_tokens,
             completion_tokens: obj.usage.completion_tokens,
             total_tokens: obj.usage.total_tokens,
+            ...usageTelemetry(obj.usage),
             ...(typeof obj.usage.credit === 'number' ? { credit: obj.usage.credit } : {}),
           }
         : null,
+  };
+}
+
+/**
+ * The upstream reports prompt-cache usage in several dialects (OpenAI
+ * \`*_tokens_details.cached_tokens\`, DeepSeek \`prompt_cache_hit_tokens\`); accept
+ * any of them so the cache hit survives to the client and the log.
+ */
+function usageTelemetry(usage: Record<string, any>): { cached_tokens?: number; reasoning_tokens?: number } {
+  const number = (...candidates: unknown[]) => {
+    for (const value of candidates) if (typeof value === 'number' && Number.isFinite(value)) return value;
+    return undefined;
+  };
+  const cached = number(
+    usage.prompt_tokens_details?.cached_tokens,
+    usage.input_tokens_details?.cached_tokens,
+    usage.prompt_cache_hit_tokens,
+    usage.cache_read_input_tokens,
+    usage.cached_tokens,
+  );
+  const reasoning = number(
+    usage.completion_tokens_details?.reasoning_tokens,
+    usage.output_tokens_details?.reasoning_tokens,
+    usage.completion_thinking_tokens,
+  );
+  return {
+    ...(cached !== undefined ? { cached_tokens: cached } : {}),
+    ...(reasoning !== undefined ? { reasoning_tokens: reasoning } : {}),
+  };
+}
+
+/**
+ * WorkBuddy nests error details (`{error:{data:{code,msg}}}`), while other
+ * deployments answer flat (`{code,msg}`). Read both so upstream codes such as
+ * 14018 (credits exhausted) and 410004 (account restricted) are not lost.
+ */
+export function errorFields(parsed: Record<string, any> | null): {
+  code?: string;
+  message?: string;
+} {
+  if (!parsed) return {};
+  const nested = parsed.error && typeof parsed.error === 'object' ? parsed.error : undefined;
+  const data = nested?.data && typeof nested.data === 'object' ? nested.data : undefined;
+  const code = data?.code ?? nested?.code ?? parsed.code;
+  const message =
+    [data?.msg, nested?.msg, nested?.message, parsed.msg, parsed.message].find(
+      (value): value is string => typeof value === 'string' && value.trim() !== '',
+    ) ?? undefined;
+  return {
+    ...(code !== undefined && code !== null && code !== '' ? { code: String(code) } : {}),
+    ...(message !== undefined ? { message } : {}),
   };
 }
 

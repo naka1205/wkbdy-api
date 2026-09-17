@@ -1,4 +1,4 @@
-import type { UpstreamChunk } from '../upstream.js';
+import type { UpstreamChunk, UpstreamUsage } from '../upstream.js';
 
 /**
  * Upstream events → OpenAI responses. The upstream is a near-standard
@@ -14,6 +14,9 @@ export type OpenAiUsage = {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /** Standard OpenAI telemetry, so clients can see what the prompt cache saved. */
+  prompt_tokens_details: { cached_tokens: number };
+  completion_tokens_details: { reasoning_tokens: number };
 };
 
 export type OpenAiToolCall = {
@@ -54,6 +57,23 @@ export function toOpenAiChunk(
         finish_reason: chunk.finish_reason,
       },
     ],
+  };
+}
+
+/**
+ * Upstream usage → the OpenAI usage block. Cache hits and reasoning tokens are
+ * standard OpenAI telemetry (`*_tokens_details`), so clients and SDKs that
+ * aggregate cost can read them without WorkBuddy-specific fields.
+ */
+export function toOpenAiUsage(usage: UpstreamUsage | null | undefined): OpenAiUsage {
+  const prompt = usage?.prompt_tokens ?? 0;
+  const completion = usage?.completion_tokens ?? 0;
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: usage?.total_tokens ?? prompt + completion,
+    prompt_tokens_details: { cached_tokens: usage?.cached_tokens ?? 0 },
+    completion_tokens_details: { reasoning_tokens: usage?.reasoning_tokens ?? 0 },
   };
 }
 
@@ -141,11 +161,7 @@ export class CompletionAggregator {
     }
     if (chunk.finish_reason) this.finishReason = chunk.finish_reason;
     if (chunk.usage) {
-      this.usage = {
-        prompt_tokens: chunk.usage.prompt_tokens ?? 0,
-        completion_tokens: chunk.usage.completion_tokens ?? 0,
-        total_tokens: chunk.usage.total_tokens ?? 0,
-      };
+      this.usage = toOpenAiUsage(chunk.usage);
       if (typeof chunk.usage.credit === 'number') this.credits = chunk.usage.credit;
     }
   }

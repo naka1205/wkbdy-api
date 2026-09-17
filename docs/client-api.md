@@ -99,9 +99,17 @@ curl http://127.0.0.1:7891/v1/chat/completions \
   "created": 1730000000,
   "model": "deepseek-v4.1-flash",
   "choices": [{ "index": 0, "message": { "role": "assistant", "content": "pong" }, "finish_reason": "stop" }],
-  "usage": { "prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15 }
+  "usage": {
+    "prompt_tokens": 12,
+    "completion_tokens": 3,
+    "total_tokens": 15,
+    "prompt_tokens_details": { "cached_tokens": 8 },
+    "completion_tokens_details": { "reasoning_tokens": 3 }
+  }
 }
 ```
+
+`prompt_tokens_details.cached_tokens` 是上游提示缓存命中的输入 Token（DeepSeek `prompt_cache_hit_tokens` 等等价字段会归一到它），`completion_tokens_details.reasoning_tokens` 是计在 `completion_tokens` 内的思考 Token；两者缺失时为 0，与 OpenAI 的 usage 形状一致，SDK 可直接读取。`usage.credit`（WorkBuddy 计费）只写日志，不下发。
 
 思考过程（上游 `reasoning_content`）原样保留在 `message` 与 delta 中；是否输出取决于上游。
 
@@ -120,7 +128,7 @@ curl -N http://127.0.0.1:7891/v1/chat/completions \
 
 支持 `model`、`input`（字符串或 item 数组）、`instructions`、`stream`、`temperature`、`top_p`、`max_output_tokens`、`tools`、`tool_choice`、`parallel_tool_calls`、`reasoning`、`thinking`、`context_window`、`store`。
 
-- 非流式：返回完整的 `response` 对象（含 `output`、`usage`）。
+- 非流式：返回完整的 `response` 对象（含 `output`、`usage`）；流式的 `response.completed` 事件同样带 `usage`。`usage.input_tokens_details.cached_tokens` 与 `usage.output_tokens_details.reasoning_tokens` 为上游缓存命中/思考 Token（缺失为 0）。
 - 与 chat completions 相同，未知顶层字段会被忽略并记入日志，而不是返回 400。
 - 流式：按官方事件序列输出 `response.created` → `response.in_progress` → `response.output_text.delta` → `response.output_text.done` → `response.completed`，每帧带 `sequence_number`。
 

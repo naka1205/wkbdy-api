@@ -84,10 +84,25 @@ export function isQuotaFailure(status: number, code?: unknown, message?: unknown
       'quota_exhausted',
       'balance_exhausted',
       'credits_exhausted',
+      // WorkBuddy's own code for "Credits exhausted".
+      '14018',
     ].includes(normalized)
   )
     return true;
   return typeof message === 'string' && QUOTA_PATTERNS.test(message);
+}
+
+const BLOCKED_CODES = new Set(['410004']);
+const BLOCKED_PATTERNS =
+  /封控|风控|账号(?:被)?(?:封禁|封停|限制|禁用|停用)|account (?:has been )?(?:blocked|banned|suspended|restricted)/i;
+
+/**
+ * Upstream risk control: the account itself may not be used any more, so the
+ * pool disables it instead of retrying (autoclaw-api treats 410004 the same way).
+ */
+export function isAccountBlocked(code?: unknown, message?: unknown): boolean {
+  if (BLOCKED_CODES.has(String(code ?? '').trim())) return true;
+  return typeof message === 'string' && BLOCKED_PATTERNS.test(message);
 }
 
 export function isRateLimited(error: unknown): boolean {

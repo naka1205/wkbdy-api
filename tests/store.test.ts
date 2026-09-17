@@ -249,6 +249,108 @@ test('the agent whitelist decides which models clients can see', (t) => {
   assert.equal(store.exposedModels().length, 0);
 });
 
+test('account usage counters include credits', (t) => {
+  const { store } = storeFixture(t);
+  const id = store.upsertAccount({
+    name: 'metered',
+    note: '',
+    source: 'manual',
+    accessToken: 'token-one',
+    refreshToken: '',
+    userId: 'user-1',
+    domain: 'www.workbuddy.ai',
+  }).id;
+  store.markUsed(id, 100, 2.5);
+  store.markUsed(id, 50, 1.5);
+  const account = store.account(id)!;
+  assert.equal(account.requests, 2);
+  assert.equal(account.tokens, 150);
+  assert.equal(account.credits, 4);
+});
+
+test('quota exhaustion is flagged and cleared, blocked accounts are disabled', (t) => {
+  const { store } = storeFixture(t);
+  const id = store.upsertAccount({
+    name: 'metered',
+    note: '',
+    source: 'manual',
+    accessToken: 'token-one',
+    refreshToken: '',
+    userId: 'user-1',
+    domain: 'www.workbuddy.ai',
+  }).id;
+  store.markQuotaExhausted(id, 60_000, 'Credits exhausted.');
+  assert.ok(store.account(id)!.quotaExhaustedAt !== null);
+  // A successful call proves the account works again, so the flag clears.
+  store.reportSuccess(id);
+  assert.equal(store.account(id)!.quotaExhaustedAt, null);
+
+  store.disableAccount(id, 'Upstream blocked this account.');
+  const blocked = store.account(id)!;
+  assert.equal(blocked.enabled, false);
+  assert.match(blocked.lastError ?? '', /blocked/);
+  // Re-enabling from the panel also clears the stale quota flag.
+  store.patchAccount(id, { enabled: true });
+  assert.equal(store.account(id)!.enabled, true);
+  assert.equal(store.account(id)!.quotaExhaustedAt, null);
+});
+
+test('account usage survives log clearing and credential re-imports', (t) => {
+  const { store } = storeFixture(t);
+  const account = store.upsertAccount({
+    name: 'metered',
+    note: '',
+    source: 'manual',
+    accessToken: 'token-one',
+    refreshToken: '',
+    userId: 'user-1',
+    domain: 'www.workbuddy.ai',
+  });
+  store.markUsed(account.id, 120, 7.5);
+  store.markQuotaExhausted(account.id, 60_000, 'Credits exhausted.');
+  store.recordLog({
+    requestId: 'req-1',
+    timestamp: new Date().toISOString(),
+    apiKeyId: null,
+    apiKeyName: null,
+    model: 'm',
+    accountId: account.id,
+    stream: false,
+    status: 200,
+    durationMs: 1,
+    inputTokens: 1,
+    outputTokens: 1,
+    totalTokens: 2,
+    credits: 7.5,
+    error: null,
+  });
+
+  store.clearLogs();
+
+  // The counters live on the account row, so clearing logs keeps them.
+  assert.equal(store.logs().total, 0);
+  const kept = store.account(account.id)!;
+  assert.equal(kept.requests, 1);
+  assert.equal(kept.tokens, 120);
+  assert.equal(kept.credits, 7.5);
+
+  // Re-importing the same upstream identity refreshes credentials without
+  // resetting consumption, and marks the account as usable again.
+  const reimported = store.upsertAccount({
+    name: 'metered',
+    note: '',
+    source: 'manual',
+    accessToken: 'token-two',
+    refreshToken: '',
+    userId: 'user-1',
+    domain: 'www.workbuddy.ai',
+  });
+  assert.equal(reimported.id, account.id);
+  assert.equal(reimported.credits, 7.5);
+  assert.equal(reimported.tokens, 120);
+  assert.equal(reimported.quotaExhaustedAt, null);
+});
+
 test('request logs are recorded, filtered and pruned', (t) => {
   const { store } = storeFixture(t);
   const base = {
@@ -264,6 +366,8 @@ test('request logs are recorded, filtered and pruned', (t) => {
     inputTokens: 3,
     outputTokens: 4,
     totalTokens: 7,
+    cacheHitTokens: 2,
+    reasoningTokens: 1,
     credits: 5,
     error: null,
   };
@@ -278,6 +382,9 @@ test('request logs are recorded, filtered and pruned', (t) => {
   assert.equal(stats.errors24h, 1);
   assert.equal(stats.tokens24h, 14);
   assert.equal(stats.credits24h, 10);
+  assert.equal(stats.cacheHitTokens24h, 4);
+  assert.equal(store.logs().entries[0]!.cacheHitTokens, 2);
+  assert.equal(store.logs().entries[0]!.reasoningTokens, 1);
   assert.equal(stats.perModel[0]!.model, 'deepseek-v4.1-flash');
   store.clearLogs();
   assert.equal(store.logs().total, 0);

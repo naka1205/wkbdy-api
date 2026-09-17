@@ -160,7 +160,16 @@ test('the aggregator builds a complete completion with usage', () => {
   aggregator.push(
     chunk(
       {},
-      { finish_reason: 'stop', usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } },
+      {
+        finish_reason: 'stop',
+        usage: {
+          prompt_tokens: 10,
+          completion_tokens: 4,
+          total_tokens: 14,
+          cached_tokens: 8,
+          reasoning_tokens: 3,
+        },
+      },
     ),
   );
   const built = aggregator.build('m');
@@ -168,5 +177,11 @@ test('the aggregator builds a complete completion with usage', () => {
   assert.equal(built.model, 'm');
   assert.deepEqual(built.choices[0]?.message, { role: 'assistant', content: '你好' });
   assert.equal(built.choices[0]?.finish_reason, 'stop');
-  assert.deepEqual(built.usage, { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 });
+  assert.deepEqual(built.usage, {
+    prompt_tokens: 10,
+    completion_tokens: 4,
+    total_tokens: 14,
+    prompt_tokens_details: { cached_tokens: 8 },
+    completion_tokens_details: { reasoning_tokens: 3 },
+  });
 });

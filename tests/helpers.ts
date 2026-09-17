@@ -23,8 +23,17 @@ export const upstreamBody = JSON.stringify({
 export const streamPayload =
   `data: ${JSON.stringify({ id: 'chatcmpl-1', model: 'deepseek-v4.1-flash', choices: [{ index: 0, delta: { role: 'assistant', content: '你' } }] })}\n\n` +
   `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '好' } }] })}\n\n` +
-  `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } })}\n\n` +
+  `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_cache_hit_tokens: 8, completion_thinking_tokens: 3 } })}\n\n` +
   'data: [DONE]\n\n';
+
+/** Usage block the gateway derives from {@link streamPayload}. */
+export const streamUsage = {
+  prompt_tokens: 10,
+  completion_tokens: 4,
+  total_tokens: 14,
+  prompt_tokens_details: { cached_tokens: 8 },
+  completion_tokens_details: { reasoning_tokens: 3 },
+};
 
 export const json = (value: unknown, status = 200, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(value), {

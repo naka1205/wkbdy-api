@@ -7,6 +7,10 @@ export type RequestOutcome = {
   accountId?: string;
   inputTokens?: number;
   outputTokens?: number;
+  /** Prompt tokens the upstream served from its prompt cache. */
+  cacheHitTokens?: number;
+  /** Reasoning tokens billed inside outputTokens. */
+  reasoningTokens?: number;
   /** Credits the upstream charged for this request (WorkBuddy `usage.credit`). */
   credits?: number;
   /** Trace ID the upstream echoed back for this call. */
@@ -50,6 +54,8 @@ export function requestRecorder(
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
+      cacheHitTokens: outcome.cacheHitTokens ?? 0,
+      reasoningTokens: outcome.reasoningTokens ?? 0,
       credits: outcome.credits ?? 0,
       taskId: correlation?.taskId ?? null,
       sessionId: correlation?.sessionId ?? null,

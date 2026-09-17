@@ -25,7 +25,17 @@ type FunctionItem = {
   arguments: string;
 };
 
-export type ResponseOutputItem = TextItem | FunctionItem;
+/** Freeform tool call (Codex's \`exec\`): the argument is raw text, not JSON. */
+type CustomToolItem = {
+  id: string;
+  type: 'custom_tool_call';
+  status: 'completed';
+  call_id: string;
+  name: string;
+  input: string;
+};
+
+export type ResponseOutputItem = TextItem | FunctionItem | CustomToolItem;
 
 export type OpenAiResponse = {
   id: string;
@@ -61,7 +71,8 @@ export class ResponsesBuilder {
   private text = '';
   private sawFrame = false;
   private finishReason: string | null = null;
-  private usage: ResponsesUsage | null = null;
+  /** Usage of the last upstream frame; null until the upstream reports it. */
+  usage: ResponsesUsage | null = null;
   /** WorkBuddy credits charged upstream; internal, never sent to clients. */
   credits = 0;
   private readonly tools = new Map<number, ToolState>();
@@ -89,9 +100,9 @@ export class ResponsesBuilder {
       const output = chunk.usage.completion_tokens ?? 0;
       this.usage = {
         input_tokens: input,
-        input_tokens_details: { cached_tokens: 0 },
+        input_tokens_details: { cached_tokens: chunk.usage.cached_tokens ?? 0 },
         output_tokens: output,
-        output_tokens_details: { reasoning_tokens: 0 },
+        output_tokens_details: { reasoning_tokens: chunk.usage.reasoning_tokens ?? 0 },
         total_tokens: chunk.usage.total_tokens ?? input + output,
       };
     }
@@ -106,6 +117,8 @@ export class ResponsesBuilder {
     topP?: number;
     toolChoice?: string | Record<string, unknown>;
     tools?: unknown[];
+    /** Tools declared as freeform by the client; their calls are not JSON. */
+    customTools?: ReadonlySet<string>;
   }): OpenAiResponse {
     if (!this.sawFrame) throw new Error('Upstream stream ended without producing a response.');
     if (!this.finishReason) throw new Error('Upstream response did not include a finish reason.');
@@ -122,6 +135,18 @@ export class ResponsesBuilder {
     }
     for (const [, tool] of [...this.tools.entries()].sort((a, b) => a[0] - b[0])) {
       if (!tool.callId || !tool.name) throw new Error('Upstream returned an incomplete function call.');
+      if (options.customTools?.has(tool.name)) {
+        // Freeform tools answer with plain text, so valid JSON cannot be assumed.
+        output.push({
+          id: tool.id,
+          type: 'custom_tool_call',
+          status: 'completed',
+          call_id: tool.callId,
+          name: tool.name,
+          input: freeformInput(tool.arguments),
+        });
+        continue;
+      }
       try {
         JSON.parse(tool.arguments);
       } catch {
@@ -163,6 +188,23 @@ export class ResponsesBuilder {
       metadata: {},
     };
   }
+}
+
+/**
+ * The upstream answers a wrapped freeform tool with {"input": "…"}; unwrap it
+ * so the client sees the raw text, falling back to the argument string itself.
+ */
+export function freeformInput(argumentsText: string): string {
+  try {
+    const parsed = JSON.parse(argumentsText) as unknown;
+    if (typeof parsed === 'string') return parsed;
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { input?: unknown }).input === 'string') {
+      return (parsed as { input: string }).input;
+    }
+  } catch {
+    // Not JSON: freeform tools legitimately send raw text.
+  }
+  return argumentsText;
 }
 
 export function localResponseId(): string {

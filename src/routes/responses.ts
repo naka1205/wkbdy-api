@@ -1,14 +1,22 @@
 import type { FastifyInstance } from 'fastify';
 import {
   ResponsesInputError,
+  mapResponsesRequest,
+  RESPONSES_REQUEST_FIELDS,
   responsesRequestSchema,
-  toWorkBuddyResponseRequest,
+  type ResponsesMapping,
 } from '../openai/responses-request-mapper.js';
 import { normalizeOpenAiRequestBody } from '../request.js';
-import { ResponsesBuilder } from '../openai/responses-builder.js';
+import { ResponsesBuilder, freeformInput } from '../openai/responses-builder.js';
 import { openAiError } from '../openai/errors.js';
 import { AppError } from '../errors.js';
-import { mapUpstreamError, reportQuotaFailure } from '../proxy.js';
+import {
+  applyRetryAfter,
+  mapUpstreamError,
+  openUpstream,
+  reportAccountFailure,
+  upstreamErrorPayload,
+} from '../proxy.js';
 import type { IssuedCredential, UpstreamChunk, WorkBuddyClient } from '../upstream.js';
 import { resolvedContextWindow } from '../models.js';
 import type { Accounts } from '../accounts.js';
@@ -30,7 +38,10 @@ type ResponsesOptions = {
   dump?: DumpSink;
 };
 
-function responseOptions(request: ReturnType<typeof responsesRequestSchema.parse>) {
+function responseOptions(
+  request: ReturnType<typeof responsesRequestSchema.parse>,
+  mapping?: ResponsesMapping,
+) {
   return {
     model: request.model,
     instructions: request.instructions,
@@ -39,7 +50,8 @@ function responseOptions(request: ReturnType<typeof responsesRequestSchema.parse
     temperature: request.temperature,
     topP: request.top_p,
     toolChoice: request.tool_choice,
-    tools: request.tools,
+    tools: mapping?.tools ?? request.tools,
+    customTools: mapping?.customTools,
   };
 }
 
@@ -70,7 +82,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     }
 
     // Unknown top-level fields are ignored rather than rejected; see proxy.ts.
-    const ignoredFields = Object.keys(body).filter((key) => !(key in responsesRequestSchema.shape));
+    const ignoredFields = Object.keys(body).filter((key) => !RESPONSES_REQUEST_FIELDS.has(key));
     if (ignoredFields.length) {
       notes.push(`ignored unsupported parameters: ${ignoredFields.join(', ')}`);
       req.log.warn({ ignored: ignoredFields }, 'ignored unsupported responses parameters');
@@ -90,12 +102,13 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     const parsed = responsesRequestSchema.safeParse(body);
     if (!parsed.success) {
       const issue = parsed.error.issues[0];
+      const path = issue?.path.join('.') ?? '';
       return fail(
         openAiError(
           400,
           'invalid_request',
-          issue?.message ?? 'Invalid Responses request.',
-          issue?.path.join('.') || null,
+          issue ? `${path ? `${path}: ` : ''}${issue.message}` : 'Invalid Responses request.',
+          path || null,
         ),
       );
     }
@@ -129,13 +142,28 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       model,
       (request as { context_window?: number }).context_window,
     );
-    let upstream;
+    let mapped: ResponsesMapping;
     try {
-      upstream = toWorkBuddyResponseRequest({ ...request, context_window });
+      mapped = mapResponsesRequest(request, { contextWindow: context_window });
     } catch (error) {
-      const message = error instanceof ResponsesInputError ? error.message : 'Invalid Responses request.';
-      return fail(openAiError(400, 'invalid_request', message));
+      if (error instanceof ResponsesInputError) {
+        return fail(
+          openAiError(
+            400,
+            'invalid_request',
+            `${error.path ? `${error.path}: ` : ''}${error.message}`,
+            error.path ?? null,
+          ),
+        );
+      }
+      return fail(openAiError(400, 'invalid_request', 'Invalid Responses request.'));
     }
+    if (mapped.ignored.length) {
+      notes.push(`ignored input items: ${mapped.ignored.slice(0, 10).join(', ')}`);
+      note = notes.join('; ');
+      req.log.warn({ ignored: mapped.ignored }, 'ignored unsupported responses items');
+    }
+    const upstream = mapped.upstream;
 
     const abort = new AbortController();
     const onClose = () => {
@@ -145,7 +173,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
 
     let credential: IssuedCredential | undefined;
     try {
-      const opened = await opts.client.streamChatCompletion(upstream, abort.signal, {
+      const opened = await openUpstream(opts.client, opts.accounts, upstream, abort.signal, {
         apiKeyId: req.apiKeyId ?? undefined,
         requireDone: true,
         requestId: correlation.logicalRequestId,
@@ -156,10 +184,17 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
 
       if (!request.stream) {
         for await (const chunk of opened.stream) builder.push(chunk);
-        const response = builder.build(responseOptions(request));
+        const response = builder.build(responseOptions(request, mapped));
+        // Count the call against the account even though Responses is buffered
+        // here; otherwise Codex traffic never shows up in the account stats.
+        opts.accounts.reportSuccess(credential, builder.usage?.total_tokens ?? 0, builder.credits);
         finish({
           status: 200,
           accountId: credential.accountId,
+          inputTokens: builder.usage?.input_tokens,
+          outputTokens: builder.usage?.output_tokens,
+          cacheHitTokens: builder.usage?.input_tokens_details.cached_tokens,
+          reasoningTokens: builder.usage?.output_tokens_details.reasoning_tokens,
           credits: builder.credits,
           upstreamRequestId,
         });
@@ -198,7 +233,18 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
 
       let textStarted = false;
       let messageId = '';
-      const toolIds = new Map<number, { itemId: string; callId: string; name: string; arguments: string }>();
+      const toolIds = new Map<
+        number,
+        {
+          itemId: string;
+          callId: string;
+          name: string;
+          arguments: string;
+          /** The item is announced once its name is known, which decides the type. */
+          added: boolean;
+          custom: boolean;
+        }
+      >();
 
       const emitChunk = (chunk: UpstreamChunk) => {
         builder.push(chunk);
@@ -237,39 +283,59 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
             state = {
               itemId: `fc_${builder.responseId.slice(5)}_${index}`,
               callId: call.id ?? `call_${index}`,
-              name: call.function?.name ?? '',
+              name: '',
               arguments: '',
+              added: false,
+              custom: false,
             };
             toolIds.set(index, state);
+          }
+          if (call.id) state.callId = call.id;
+          if (call.function?.name) state.name += call.function.name;
+          if (!state.added && state.name) {
+            // Announce only in_progress items; the final item arrives in
+            // output_item.done, so the type only has to be close enough here.
+            state.added = true;
+            state.custom = mapped.customTools.has(state.name);
             writeEvent('response.output_item.added', {
               output_index: outputIndex,
-              item: {
-                id: state.itemId,
-                type: 'function_call',
-                status: 'in_progress',
-                call_id: state.callId,
-                name: state.name,
-                arguments: '',
-              },
+              item: state.custom
+                ? {
+                    id: state.itemId,
+                    type: 'custom_tool_call',
+                    status: 'in_progress',
+                    call_id: state.callId,
+                    name: state.name,
+                    input: '',
+                  }
+                : {
+                    id: state.itemId,
+                    type: 'function_call',
+                    status: 'in_progress',
+                    call_id: state.callId,
+                    name: state.name,
+                    arguments: '',
+                  },
             });
-          } else {
-            if (call.id) state.callId = call.id;
-            if (call.function?.name) state.name += call.function.name;
           }
           if (call.function?.arguments) {
             state.arguments += call.function.arguments;
-            writeEvent('response.function_call_arguments.delta', {
-              item_id: state.itemId,
-              output_index: outputIndex,
-              delta: call.function.arguments,
-            });
+            // Freeform input cannot be unwrapped incrementally, so only the
+            // final .done event carries it.
+            if (!state.custom) {
+              writeEvent('response.function_call_arguments.delta', {
+                item_id: state.itemId,
+                output_index: outputIndex,
+                delta: call.function.arguments,
+              });
+            }
           }
         }
       };
 
       emitChunk(first.value);
       for await (const chunk of opened.stream) emitChunk(chunk);
-      const response = builder.build(responseOptions(request));
+      const response = builder.build(responseOptions(request, mapped));
 
       if (textStarted) {
         const item = response.output.find((entry) => entry.type === 'message');
@@ -291,36 +357,50 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       }
       for (const [index, state] of toolIds) {
         const outputIndex = (textStarted ? 1 : 0) + index;
-        const item = response.output.find(
-          (entry) => entry.type === 'function_call' && entry.call_id === state.callId,
-        );
-        writeEvent('response.function_call_arguments.done', {
-          item_id: state.itemId,
-          output_index: outputIndex,
-          arguments: state.arguments,
-        });
+        const item = response.output.find((entry) => 'call_id' in entry && entry.call_id === state.callId);
+        if (state.custom) {
+          writeEvent('response.custom_tool_call_input.done', {
+            item_id: state.itemId,
+            output_index: outputIndex,
+            input: freeformInput(state.arguments),
+          });
+        } else {
+          writeEvent('response.function_call_arguments.done', {
+            item_id: state.itemId,
+            output_index: outputIndex,
+            arguments: state.arguments,
+          });
+        }
         if (item) writeEvent('response.output_item.done', { output_index: outputIndex, item });
       }
       writeEvent('response.completed', { response });
+      opts.accounts.reportSuccess(credential, builder.usage?.total_tokens ?? 0, builder.credits);
       finish({
         status: 200,
         accountId: credential.accountId,
+        inputTokens: builder.usage?.input_tokens,
+        outputTokens: builder.usage?.output_tokens,
+        cacheHitTokens: builder.usage?.input_tokens_details.cached_tokens,
+        reasoningTokens: builder.usage?.output_tokens_details.reasoning_tokens,
         credits: builder.credits,
         upstreamRequestId,
       });
       reply.raw.end();
     } catch (error) {
-      reportQuotaFailure(opts.accounts, error);
+      reportAccountFailure(opts.accounts, error);
       const mapped = mapUpstreamError(error);
       finish({
         status: abort.signal.aborted ? 499 : mapped.statusCode,
         error: mapped.body.error.code,
         detail: mapped.body.error.message,
       });
-      if (!reply.raw.headersSent) return reply.code(mapped.statusCode).send(mapped.body);
+      if (!reply.raw.headersSent) {
+        applyRetryAfter(reply, mapped);
+        return reply.code(mapped.statusCode).send(upstreamErrorPayload(mapped));
+      }
       if (!reply.raw.destroyed && !abort.signal.aborted) {
         reply.raw.write(
-          `event: error\ndata: ${JSON.stringify({ type: 'error', error: mapped.body.error })}\n\n`,
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: upstreamErrorPayload(mapped) })}\n\n`,
         );
         reply.raw.end();
       }

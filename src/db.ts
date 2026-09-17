@@ -78,6 +78,7 @@ export function openDatabase(dataDir: string): Database.Database {
       stream INTEGER NOT NULL, status INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
       input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0, credits REAL NOT NULL DEFAULT 0,
+      cache_hit_tokens INTEGER NOT NULL DEFAULT 0, reasoning_tokens INTEGER NOT NULL DEFAULT 0,
       task_id TEXT, session_id TEXT, trace_id TEXT, client_request_id TEXT,
       logical_request_id TEXT, client_attempt INTEGER, upstream_request_id TEXT,
       error TEXT
@@ -104,6 +105,11 @@ export function openDatabase(dataDir: string): Database.Database {
     // WorkBuddy bills in credits; the upstream reports them in `usage.credit`.
     if (!logColumns.includes('credits'))
       db.exec('ALTER TABLE request_logs ADD COLUMN credits REAL NOT NULL DEFAULT 0');
+    // Prompt-cache and reasoning telemetry, surfaced to clients and the panel.
+    if (!logColumns.includes('cache_hit_tokens'))
+      db.exec('ALTER TABLE request_logs ADD COLUMN cache_hit_tokens INTEGER NOT NULL DEFAULT 0');
+    if (!logColumns.includes('reasoning_tokens'))
+      db.exec('ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0');
     // Client correlation IDs plus the trace ID the upstream echoes back.
     for (const column of [
       'task_id TEXT',
@@ -133,7 +139,15 @@ export function openDatabase(dataDir: string): Database.Database {
     // The account's upstream e-mail, decoded from the Keycloak access token so
     // the panel can tell two upstream identities apart.
     if (!accountColumns.includes('email')) db.exec('ALTER TABLE accounts ADD COLUMN email TEXT');
-    db.pragma('user_version = 7');
+    // Credits the upstream charged for this account, so the panel can show
+    // consumption per account instead of only per key.
+    if (!accountColumns.includes('credits'))
+      db.exec('ALTER TABLE accounts ADD COLUMN credits REAL NOT NULL DEFAULT 0');
+    // When the upstream said this account is out of credits; the panel paints
+    // the credit number red and any successful call clears it again.
+    if (!accountColumns.includes('quota_exhausted_at'))
+      db.exec('ALTER TABLE accounts ADD COLUMN quota_exhausted_at INTEGER');
+    db.pragma('user_version = 10');
   })();
   return db;
 }

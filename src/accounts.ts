@@ -30,6 +30,10 @@ export type PoolAccountView = {
   consecutive_failures: number;
   requests: number;
   tokens: number;
+  /** Credits the upstream charged for this account's requests. */
+  credits: number;
+  /** The upstream reported this account out of credits; the panel shows red. */
+  quota_exhausted: boolean;
   last_error: string | null;
   last_used_at: number | null;
   /** Client key that currently keeps this account, when key pinning is on. */
@@ -97,6 +101,8 @@ export class Accounts {
       consecutive_failures: account.consecutiveFailures,
       requests: account.requests,
       tokens: account.tokens,
+      credits: account.credits,
+      quota_exhausted: account.quotaExhaustedAt !== null,
       last_error: account.lastError,
       last_used_at: account.lastUsedAt,
       bound_key_id: owners.get(account.id) ?? null,
@@ -263,6 +269,18 @@ export class Accounts {
     this.store.reportFailure(accountId, this.cooldownMs(), message);
   }
 
+  /** The upstream says this account is out of credits. */
+  reportQuotaExhausted(accountId: string | undefined, message?: string): void {
+    if (!accountId) return;
+    this.store.markQuotaExhausted(accountId, this.cooldownMs(), message);
+  }
+
+  /** Upstream risk control: disable the account; waiting cannot fix it. */
+  reportBlocked(accountId: string | undefined, message?: string): void {
+    if (!accountId) return;
+    this.store.disableAccount(accountId, message);
+  }
+
   /**
    * Report a transient upstream failure (5xx, 429, network). The first
    * `TRANSIENT_STRIKES_BEFORE_PAUSE` failures only count; after that the
@@ -273,10 +291,10 @@ export class Accounts {
     this.store.reportTransientFailure(accountId, this.cooldownMs(), TRANSIENT_STRIKES_BEFORE_PAUSE, message);
   }
 
-  reportSuccess(credential: IssuedCredential, tokens = 0): void {
+  reportSuccess(credential: IssuedCredential, tokens = 0, credits = 0): void {
     if (!credential.accountId) return;
     this.store.reportSuccess(credential.accountId);
-    this.store.markUsed(credential.accountId, tokens);
+    this.store.markUsed(credential.accountId, tokens, credits);
   }
 
   invalidate(): void {}
