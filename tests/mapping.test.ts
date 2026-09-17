@@ -82,6 +82,51 @@ test('unknown fields are stripped instead of rejected', () => {
   assert.throws(() => parse({ model: '', messages: [{ role: 'user', content: 'x' }] }));
 });
 
+test('a tool-calling assistant turn may carry null content', () => {
+  // OpenAI's canonical shape for "assistant called tools, no prose", and what
+  // ZCode sends mid-conversation.
+  const request = parse({
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'run it' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'Bash', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: 'ok' },
+    ],
+  });
+  const upstream = toUpstreamRequest(request);
+  const assistant = upstream.messages.find((message) => message.role === 'assistant') as unknown as {
+    content: unknown;
+    tool_calls: unknown[];
+  };
+  assert.equal(assistant.content, null);
+  assert.equal(assistant.tool_calls.length, 1);
+});
+
+test('legacy function-role messages still parse', () => {
+  const request = parse({
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'function', name: 'lookup', content: '{}' },
+    ],
+  });
+  assert.equal(request.messages[1]!.role, 'function');
+});
+
+test('fields dropped from inside a message are reported', () => {
+  assert.deepEqual(
+    ignoredRequestFields({
+      model: 'm',
+      messages: [{ role: 'assistant', content: 'x', function_call: { name: 'f', arguments: '{}' } }],
+    }),
+    ['messages[0].function_call'],
+  );
+});
+
 test('"[undefined]" placeholders from loose clients are dropped', () => {
   const body = normalizeOpenAiRequestBody({
     model: 'm',

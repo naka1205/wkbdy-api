@@ -61,7 +61,26 @@ export function normalizeOpenAiRequestBody(body: unknown): unknown {
  */
 export function ignoredRequestFields(body: Record<string, unknown>): string[] {
   const known = new Set(Object.keys(chatRequestSchema.shape));
-  return Object.keys(body).filter((key) => !known.has(key));
+  const dropped = Object.keys(body).filter((key) => !known.has(key));
+  return [...dropped, ...droppedMessageFields(body.messages)];
+}
+
+/**
+ * Message-level fields the schema strips. A client that sends, say, a legacy
+ * \`function_call\` would otherwise lose it without a trace.
+ */
+function droppedMessageFields(messages: unknown): string[] {
+  if (!Array.isArray(messages)) return [];
+  const knownMessageFields = new Set(['role', 'content', 'name', 'tool_calls', 'tool_call_id']);
+  const out: string[] = [];
+  messages.forEach((message, index) => {
+    if (!message || typeof message !== 'object' || Array.isArray(message)) return;
+    for (const key of Object.keys(message)) {
+      if (knownMessageFields.has(key)) continue;
+      out.push(`messages[${index}].${key}`);
+    }
+  });
+  return out.slice(0, 10);
 }
 
 /**
@@ -74,8 +93,12 @@ export const chatRequestSchema = z.object({
   messages: z
     .array(
       z.object({
-        role: z.enum(['system', 'developer', 'user', 'assistant', 'tool']),
-        content: z.union([z.string(), z.array(z.any())]).optional(),
+        // 'function' is the pre-'tool' role; older transcripts still carry it.
+        role: z.enum(['system', 'developer', 'user', 'assistant', 'tool', 'function']),
+        // A tool-calling assistant turn legitimately has "content": null, and
+        // some clients send a single content part as an object instead of an
+        // array. Both are forwarded as-is; the upstream is the final judge.
+        content: z.union([z.string(), z.array(z.any()), z.record(z.any()), z.null()]).optional(),
         name: z.string().optional(),
         tool_calls: z.array(z.any()).optional(),
         tool_call_id: z.string().optional(),
