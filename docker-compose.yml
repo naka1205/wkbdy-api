@@ -1,0 +1,24 @@
+services:
+  wkbdy-api:
+    build: .
+    container_name: wkbdy-api
+    restart: unless-stopped
+    init: true
+    ports:
+      - '127.0.0.1:${HOST_PORT:-7891}:7891'
+    environment:
+      HOST: 0.0.0.0
+      PORT: 7891
+      NODE_ENV: production
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:7891}
+      API_KEYS: ${API_KEYS:-}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
+      WKB2API_UPSTREAM_URL: ${WKB2API_UPSTREAM_URL:-https://www.workbuddy.ai/v2/chat/completions}
+      WKB2API_UPSTREAM_UA: ${WKB2API_UPSTREAM_UA:-WorkBuddy/2.137.1}
+      WKB2API_CATALOG_PATH: /app/config/wb_v3config.public.json
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - wkbdy-data:/app/data
+volumes:
+  wkbdy-data:

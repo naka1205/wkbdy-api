@@ -1,0 +1,57 @@
+{
+  "_meta": {
+    "captured_at": "2026-09-13",
+    "summary": "WorkBuddy 上游聊天协议动态验证结论（SSE 流式实测，免费模型 deepseek-v4.1-flash）"
+  },
+  "endpoint": {
+    "url": "https://www.workbuddy.ai/v2/chat/completions",
+    "method": "POST",
+    "content_type_request": "application/json",
+    "content_type_response_stream": "text/event-stream",
+    "auth_headers": {
+      "Authorization": "Bearer <RS256 JWT>",
+      "X-User-Id": "<account.uid>",
+      "X-Domain": "www.workbuddy.ai",
+      "X-Product": "SaaS",
+      "User-Agent": "WorkBuddy/2.137.1（必须单段格式，双段 UA 被 400 code:12403 拒绝）"
+    },
+    "static_evidence": "bundle codebuddy.js resolveModelBaseURL 返回 `${endpoint}/v2`，OpenAI SDK baseURL 再拼 /chat/completions；其他 X-* 内部头（X-Request-ID/X-Conversation-ID/X-IDE-* 等）为 CLI 遥测/会话头，实测不带这些头也能正常响应，2API 无需注入"
+  },
+  "request_body_rules": {
+    "format": "OpenAI Chat Completions 标准格式",
+    "required_stream": "stream 必须为 true；stream=false 被拒：400 {code:11101, msg:'Non-stream chat request is currently not supported'} → 2API 非流式端点需上游流式+本地聚合",
+    "required_system": "messages[0] 必须是 role:'system'；否则 400 {code:11128, msg:'first message is not system prompt'} → 2API 需自动注入默认 system",
+    "tools": "OpenAI 标准 tools/tool_choice 直接透传，已验证 tool_choice:'auto' + function tool 正常工作"
+  },
+  "sse_event_format": {
+    "framing": "标准 `data: {json}\\n\\n` 帧，无 event: 行，结束帧 `data: [DONE]`",
+    "chunk_shape": "与 OpenAI chat.completion.chunk 高度一致：id(cmb- 前缀)、model、object、created、choices[0].index/delta/logprobs/finish_reason、usage",
+    "delta_fields": {
+      "content": "OpenAI 相同",
+      "reasoning_content": "OpenAI 扩展（思考模型增量），每帧都存在（空串）",
+      "tool_calls": "OpenAI 相同：首帧带 id/type/function.name，后续帧只有 function.arguments 增量 + index",
+      "function_call": "遗留字段，恒为 null 或空 name/arguments 空壳（最终帧出现空壳 {name:'',arguments:''}）",
+      "refusal": "恒为空串",
+      "extra_fields": "恒为 null",
+      "role": "仅首帧和最终帧带 role:'assistant'"
+    },
+    "finish_reason": "空串 '' 表示未结束（OpenAI 是 null）；'stop'/'tool_calls' 与 OpenAI 相同",
+    "usage": "仅在 finish_reason 帧出现一次（usage:null 在其他帧），字段：prompt_tokens/completion_tokens/total_tokens + 两个 *_details 对象 + WorkBuddy 扩展（prompt_cache_hit_tokens/credit 等）"
+  },
+  "differences_vs_openai": [
+    "finish_reason 用空串而非 null 表示进行中",
+    "delta 中恒有 reasoning_content/refusal/tool_calls/extra_fields 字段（空值），OpenAI 中这些字段缺省",
+    "usage 含大量扩展字段（credit/prompt_cache_* 等）",
+    "非流式完全不支持（OpenAI 支持）",
+    "必须 system 开头（OpenAI 不要求）",
+    "消息 id 前缀 cmb- 而非 chatcmpl-",
+    "最终帧 delta.function_call 出现 {name:'',arguments:''} 空壳，需过滤"
+  ],
+  "unknowns": {
+    "multi_tool_parallel": "未实测（未构造多工具场景，避免额外请求）；静态证据 normalizeStreamingToolCallIds 表明 CLI 会跨帧去重 tool_call id，格式与 OpenAI 增量模式一致",
+    "tool_result_roundtrip": "未实测 tool 角色消息回传；按 OpenAI 格式透传 + system 首位规则应可行，M3 实现后用真实 SDK 验证",
+    "reasoning_models": "reasoning_content 的实际非空输出未捕获（deepseek-v4.1-flash 该次未输出思考内容）；字段存在已确认",
+    "invalid_model_error": "未实测（避免无谓错误请求）；可在 M3 实现后用真实请求验证错误体",
+    "rate_limit_429": "未实测"
+  }
+}

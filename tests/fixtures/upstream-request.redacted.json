@@ -1,0 +1,26 @@
+{
+  "_meta": {
+    "captured_at": "2026-09-13",
+    "method": "POST",
+    "url": "https://www.workbuddy.ai/v2/chat/completions",
+    "content_type": "application/json",
+    "headers": {
+      "Content-Type": "application/json",
+      "Accept": "text/event-stream",
+      "Authorization": "Bearer ***REDACTED***",
+      "X-User-Id": "***REDACTED***",
+      "X-Domain": "www.workbuddy.ai",
+      "X-Product": "SaaS",
+      "User-Agent": "WorkBuddy/2.137.1",
+      "_notes": "UA 必须是单段 '名/版本' 格式；双段 CLI/WorkBuddy AI 格式会被 400 code:12403 拒绝（校验的是 coding copilot version 解析）。认证与用户头缺失时行为未单独测试（避免无谓请求），静态证据表明 CLI 每个模型请求都注入 Authorization + X-User-Id。"
+    }
+  },
+  "body": {
+    "model": "deepseek-v4.1-flash",
+    "messages": [
+      { "role": "system", "content": "You are a helpful assistant." },
+      { "role": "user", "content": "Reply with OK only." }
+    ],
+    "stream": true
+  }
+}

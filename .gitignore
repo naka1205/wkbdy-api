@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+data/*
+!data/.gitkeep
+# The admin bundle is built in wkbdy-api-admin and copied here by deploy:assets.
+static/*
+!static/.gitkeep
+coverage/
+reports/
+*.log
+.DS_Store

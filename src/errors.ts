@@ -1,0 +1,126 @@
+import { z } from 'zod';
+import { UpstreamHttpError, type UpstreamProtocolError } from './upstream.js';
+
+/** Base class for every error that carries an intended HTTP status and code. */
+export class AppError extends Error {
+  retryAfterSeconds?: number;
+  constructor(
+    readonly statusCode: number,
+    readonly code: string,
+    message: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = 'AppError';
+  }
+}
+
+export { CredentialError } from './credentials.js';
+
+export type AccountAvailability = {
+  total: number;
+  disabled: number;
+  needsReauth: number;
+  coolingDown: number;
+  available: number;
+  retryAfterSeconds?: number;
+};
+
+export class NoAvailableAccountsError extends AppError {
+  constructor(readonly availability: AccountAvailability) {
+    super(
+      503,
+      'no_available_account',
+      'No WorkBuddy account is currently available; retry later or sign in again.',
+    );
+    this.name = 'NoAvailableAccountsError';
+    this.retryAfterSeconds = availability.retryAfterSeconds;
+  }
+}
+
+export class UpstreamError extends AppError {
+  constructor(
+    status: number,
+    message: string,
+    readonly upstream?: {
+      endpoint?: string;
+      httpStatus: number;
+      code?: string;
+      message?: string;
+      retryAfterSeconds?: number;
+    },
+    readonly accountFailure?: 'credentials' | 'blocked',
+  ) {
+    super(status, 'upstream_error', message);
+    this.name = 'UpstreamError';
+  }
+}
+
+export function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Unexpected error';
+}
+
+const CREDENTIAL_CODES =
+  /^(?:invalid_grant|invalid_token|invalid_refresh_token|refresh_token_expired|token_expired)$/i;
+
+export function isCredentialFailure(status: number, code?: unknown, message?: unknown): boolean {
+  if (status === 401 || status === 403) return true;
+  return (
+    CREDENTIAL_CODES.test(String(code ?? '')) ||
+    (typeof message === 'string' && CREDENTIAL_CODES.test(message.trim()))
+  );
+}
+
+const QUOTA_PATTERNS =
+  /(?:余额|积分|额度|点数)(?:已)?(?:不足|耗尽|用尽|用完)|\binsufficient[ _-](?:balance|quota|credits?)\b|\b(?:balance|quota|credits?)(?: is)?[ _-](?:exhausted|depleted|insufficient)\b|\bcredit balance (?:is )?too low\b/i;
+
+export function isQuotaFailure(status: number, code?: unknown, message?: unknown): boolean {
+  if (status === 402) return true;
+  const normalized = String(code ?? '').toLowerCase();
+  if (
+    [
+      'insufficient_quota',
+      'insufficient_balance',
+      'quota_exhausted',
+      'balance_exhausted',
+      'credits_exhausted',
+    ].includes(normalized)
+  )
+    return true;
+  return typeof message === 'string' && QUOTA_PATTERNS.test(message);
+}
+
+export function isRateLimited(error: unknown): boolean {
+  return (
+    error instanceof UpstreamHttpError &&
+    error.status === 429 &&
+    !isQuotaFailure(429, error.code, error.upstreamMessage)
+  );
+}
+
+/** Strip credentials, tokens and control characters from any message an operator can read. */
+export function redactError(message: string, secrets: readonly string[] = []): string {
+  let safe = message;
+  const values = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
+  for (const value of values) {
+    const variants = [value];
+    try {
+      variants.push(encodeURIComponent(value));
+    } catch {
+      // Malformed Unicode in an upstream echo must not break redaction.
+    }
+    for (const variant of variants) safe = safe.replaceAll(variant, '[redacted]');
+  }
+  return safe
+    .replace(/Bearer\s+[^\s"<]+/gi, 'Bearer [redacted]')
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g, '[redacted token]')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .slice(0, 400);
+}
+
+export const zodMessage = (error: z.ZodError): string =>
+  error.issues.map((issue) => `${issue.path.join('.') || 'body'}: ${issue.message}`).join('; ');
+
+export function isUpstreamProtocolError(error: unknown): error is UpstreamProtocolError {
+  return error instanceof Error && error.name === 'UpstreamProtocolError';
+}

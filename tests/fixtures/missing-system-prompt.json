@@ -1,0 +1,15 @@
+{
+  "_meta": {
+    "captured_at": "2026-09-13",
+    "scenario": "无 system 消息时被上游拒绝",
+    "url": "https://www.workbuddy.ai/v2/chat/completions"
+  },
+  "http_status": 400,
+  "content_type": "application/json; charset=utf-8",
+  "response": {
+    "code": 11128,
+    "msg": "first message is not system prompt",
+    "requestId": "4838615f-897c-4163-973e-ed44175e9df6"
+  },
+  "_implication": "上游强制要求 messages[0].role === 'system'。2API 必须在请求映射层自动注入默认 system 消息（若无），否则任何 OpenAI 客户端的直接请求都会 400。"
+}

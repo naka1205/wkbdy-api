@@ -1,0 +1,15 @@
+{
+  "_meta": {
+    "captured_at": "2026-09-13",
+    "scenario": "stream=false 非流式请求被上游拒绝",
+    "url": "https://www.workbuddy.ai/v2/chat/completions"
+  },
+  "http_status": 400,
+  "content_type": "application/json; charset=utf-8",
+  "response": {
+    "code": 11101,
+    "msg": "Non-stream chat request is currently not supported",
+    "requestId": "ebd3f02e-1cf4-4850-a52f-6dae830f8988"
+  },
+  "_implication": "上游仅支持 stream=true。2API 非流式端点必须发 stream=true 给上游并在本地聚合为完整 chat.completion。"
+}
