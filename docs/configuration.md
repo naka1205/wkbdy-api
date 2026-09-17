@@ -61,7 +61,7 @@ Invalid configuration:
 ```json
 {
   "strategy": "round-robin",
-  "pool": { "cooldownSeconds": 60, "accountBinding": "key" },
+  "pool": { "cooldownSeconds": 60, "quotaRetrySeconds": 600, "accountBinding": "key" },
   "upstream": {
     "url": "https://www.workbuddy.ai/v2/chat/completions",
     "userAgent": "WorkBuddy/2.137.1"
@@ -75,6 +75,7 @@ Invalid configuration:
 | ------------------------------ | ---------------------- | ------------------------------------------------------------------------- |
 | `strategy`                     | `round-robin`/`random` | 账号调度策略                                                              |
 | `pool.cooldownSeconds`         | 0–3600                 | 首次临时失败的隔离时长；之后指数退避，上限 30 分钟                        |
+| `pool.quotaRetrySeconds`       | 30–86400               | 上游报「积分/额度耗尽」后的探测间隔；到期自动重试一次，充值成功即恢复     |
 | `pool.accountBinding`          | `key`/`none`           | `key`：一个客户端密钥占一个账号，直到账号不可用；`none`：每个请求独立选号 |
 | `upstream.url`                 | HTTP(S) URL            | 上游 Chat Completions 地址，改动后下一个请求即生效                        |
 | `upstream.userAgent`           | 1–200 字符             | 上游 `User-Agent`，同时作为 OAuth 版本号来源                              |

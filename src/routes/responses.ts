@@ -18,7 +18,7 @@ import {
   upstreamErrorPayload,
 } from '../proxy.js';
 import type { IssuedCredential, UpstreamChunk, WorkBuddyClient } from '../upstream.js';
-import { resolvedContextWindow } from '../models.js';
+import { modelConsumesCredits, resolvedContextWindow } from '../models.js';
 import type { Accounts } from '../accounts.js';
 import { requestRecorder, type RequestOutcome } from '../logging.js';
 import {
@@ -177,6 +177,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
         apiKeyId: req.apiKeyId ?? undefined,
         requireDone: true,
         requestId: correlation.logicalRequestId,
+        needsCredits: modelConsumesCredits(model),
       });
       credential = opened.credential;
       const upstreamRequestId = opened.upstreamRequestId;
@@ -387,7 +388,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       });
       reply.raw.end();
     } catch (error) {
-      reportAccountFailure(opts.accounts, error);
+      reportAccountFailure(opts.accounts, error, request.model, modelConsumesCredits(model));
       const mapped = mapUpstreamError(error);
       finish({
         status: abort.signal.aborted ? 499 : mapped.statusCode,

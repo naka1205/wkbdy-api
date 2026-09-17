@@ -19,6 +19,14 @@ export const settingsSchema = z
       /** Per-account cooldown after a transient upstream failure. */
       cooldownSeconds: z.number().min(0).max(3600),
       /**
+       * How long an account stays away after the upstream reports its credits
+       * are exhausted. The account is probed again when the window expires,
+       * so an operator top-up recovers it without touching the panel. This is
+       * deliberately separate from `cooldownSeconds`: an empty balance is not
+       * a broken account and must not collect failure strikes.
+       */
+      quotaRetrySeconds: z.number().int().min(30).max(86400).default(600),
+      /**
        * `key`: a client key keeps one upstream account until that account stops
        * working, so a long-running client session stays on the same identity.
        * `none`: every request picks an account on its own.
@@ -43,7 +51,7 @@ export const settingsSchema = z
 export type Settings = z.infer<typeof settingsSchema>;
 export const defaultSettings: Settings = {
   strategy: 'round-robin',
-  pool: { cooldownSeconds: 60, accountBinding: 'key' },
+  pool: { cooldownSeconds: 60, quotaRetrySeconds: 600, accountBinding: 'key' },
   upstream: {
     url: 'https://www.workbuddy.ai/v2/chat/completions',
     userAgent: 'WorkBuddy/2.137.1',

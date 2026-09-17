@@ -20,7 +20,7 @@ import {
   toOpenAiUsage,
 } from './openai/response-builder.js';
 import { openAiError } from './openai/errors.js';
-import { resolvedContextWindow, type StoredModel } from './models.js';
+import { modelConsumesCredits, resolvedContextWindow, type StoredModel } from './models.js';
 import type { Accounts } from './accounts.js';
 import {
   AppError,
@@ -121,6 +121,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     }
 
     const context_window = resolvedContextWindow(model, request.context_window);
+    const needsCredits = modelConsumesCredits(model);
     const upstreamBody = toUpstreamRequest({ ...request, context_window });
     const abort = new AbortController();
     // Node fires 'close' on the request stream once the body is consumed —
@@ -137,6 +138,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         const opened = await openUpstream(opts.client, opts.accounts, upstreamBody, abort.signal, {
           apiKeyId: req.apiKeyId ?? undefined,
           requestId: correlation.logicalRequestId,
+          needsCredits,
         });
         credential = opened.credential;
         const { stream, upstreamRequestId } = opened;
@@ -157,7 +159,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
         });
         return built;
       } catch (error) {
-        reportAccountFailure(opts.accounts, error);
+        reportAccountFailure(opts.accounts, error, request.model, needsCredits);
         return sendUpstreamError(reply, error, finish);
       }
     }
@@ -199,6 +201,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       const opened = await openUpstream(opts.client, opts.accounts, upstreamBody, abort.signal, {
         apiKeyId: req.apiKeyId ?? undefined,
         requestId: correlation.logicalRequestId,
+        needsCredits,
       });
       credential = opened.credential;
       upstreamRequestId = opened.upstreamRequestId;
@@ -245,7 +248,7 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
       send('data: [DONE]\n\n');
       reply.raw.end();
     } catch (error) {
-      reportAccountFailure(opts.accounts, error);
+      reportAccountFailure(opts.accounts, error, request.model, needsCredits);
       const mapped = mapUpstreamError(error);
       if (!reply.raw.headersSent) {
         settle(mapped.statusCode, undefined, mapped.body.error.code, undefined, mapped.body.error.message);
@@ -317,9 +320,13 @@ export async function openUpstream(
   options: Parameters<WorkBuddyClient['streamChatCompletion']>[2],
 ): Promise<UpstreamStream> {
   let accountError: unknown;
+  // Accounts already burned by this client call, so the retry moves on instead
+  // of picking the same one again (a quota reply no longer quarantines the
+  // whole account, so nothing else would stop it).
+  const tried = new Set<string>();
   for (let attempt = 1; ; attempt++) {
     try {
-      return await client.streamChatCompletion(body, signal, options);
+      return await client.streamChatCompletion(body, signal, { ...options, excludeAccounts: tried });
     } catch (error) {
       if (signal.aborted) throw error;
       // The pool went dry while looking for a replacement: report why the
@@ -327,12 +334,16 @@ export async function openUpstream(
       if (error instanceof NoAvailableAccountsError && accountError) throw accountError;
       if (attempt >= ACCOUNT_FAILOVER_LIMIT || !isAccountScopedFailure(error)) throw error;
       accountError = error;
-      // Retiring releases the sticky binding, so the next attempt picks
-      // another account rather than hammering the one that just failed.
+      tried.add(error.accountId);
+      // The failed account is excluded from the retry, so it is used once per
+      // client call no matter which cooldown policy applies to it.
       if (isAccountBlocked(error.code, error.upstreamMessage)) {
         accounts.reportBlocked(error.accountId, error.upstreamMessage);
       } else if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
-        accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.');
+        accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.', {
+          model: body.model,
+          accountWide: !options?.needsCredits,
+        });
       } else {
         accounts.reportFailureById(error.accountId, 'Upstream rejected this account; switching.');
       }
@@ -342,18 +353,27 @@ export async function openUpstream(
 
 /**
  * Account-scoped upstream failures must leave the rotation, otherwise a pinned
- * client would keep retrying the same dead account forever. Quota exhaustion is
- * only quarantined (the account may be topped up); a risk-control block
- * disables the account outright because waiting cannot fix it.
+ * client would keep retrying the same dead account forever. Quota exhaustion
+ * parks the account for a probe window (an operator top-up brings it back
+ * automatically); a risk-control block disables it outright because waiting
+ * cannot fix it.
  */
-export function reportAccountFailure(accounts: Accounts, error: unknown): void {
+export function reportAccountFailure(
+  accounts: Accounts,
+  error: unknown,
+  model?: string,
+  needsCredits = true,
+): void {
   if (!(error instanceof UpstreamHttpError) || !error.accountId) return;
   if (isAccountBlocked(error.code, error.upstreamMessage)) {
     accounts.reportBlocked(error.accountId, error.upstreamMessage);
     return;
   }
   if (isQuotaFailure(error.status, error.code, error.upstreamMessage)) {
-    accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.');
+    accounts.reportQuotaExhausted(error.accountId, 'Upstream quota or balance is exhausted.', {
+      model,
+      accountWide: !needsCredits,
+    });
   }
 }
 
@@ -372,7 +392,9 @@ const TRANSIENT_RETRY_SECONDS = 1;
 export function mapUpstreamError(error: unknown): MappedError {
   if (error instanceof NoAvailableAccountsError) {
     return {
-      ...openAiError(503, 'upstream_error', error.message),
+      ...(error.code === 'insufficient_quota'
+        ? openAiError(429, 'insufficient_quota', error.message)
+        : openAiError(503, 'upstream_error', error.message)),
       retryAfter: error.availability.retryAfterSeconds,
     };
   }

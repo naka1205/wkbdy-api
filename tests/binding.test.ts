@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { NoAvailableAccountsError } from '../src/errors.js';
 import { fixture, type Fixture } from './helpers.js';
 
 const SECOND = 'sk-wk-second-key-0123456789abcdef';
@@ -56,6 +57,35 @@ test('a quarantined account releases its key for the next request', async (t) =>
   // Recovering the first account does not steal the key back.
   context.store.reportSuccess(first.id);
   assert.equal((await context.accounts.getCredential(id)).accountId, second.id);
+});
+
+test('a paid model that ran out of credits still serves free models', async (t) => {
+  const context = await fixture(t);
+  const account = context.store.accounts()[0]!;
+  context.store.markQuotaExhausted(account.id, 600_000, 'Credits exhausted.', {
+    model: 'gpt-5.6-sol',
+  });
+
+  // A credit-consuming model steps over it...
+  await assert.rejects(
+    () => context.accounts.getCredential(undefined, true),
+    (error: unknown) => error instanceof NoAvailableAccountsError && /out of credits/.test(error.message),
+  );
+  // ...a free model keeps using it.
+  assert.equal((await context.accounts.getCredential(undefined, false)).accountId, account.id);
+
+  // An empty balance is not a broken account: no strikes, no quarantine.
+  const parked = context.store.account(account.id)!;
+  assert.equal(parked.cooldownReason, 'quota');
+  assert.equal(parked.consecutiveFailures, 0);
+  assert.equal(parked.quarantinedUntil, 0);
+
+  // Once the probe window passes the paid model tries the account again, so a
+  // topped-up balance recovers without an operator.
+  context.store.db
+    .prepare('UPDATE accounts SET quota_retry_after=? WHERE id=?')
+    .run(Date.now() - 1, account.id);
+  assert.equal((await context.accounts.getCredential(undefined, true)).accountId, account.id);
 });
 
 test('disabling, signing out or deleting an account drops the assignment', async (t) => {

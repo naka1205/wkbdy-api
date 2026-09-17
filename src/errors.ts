@@ -22,16 +22,24 @@ export type AccountAvailability = {
   disabled: number;
   needsReauth: number;
   coolingDown: number;
+  /** Accounts parked because a credit-consuming model needs a topped-up balance. */
+  quotaBlocked: number;
   available: number;
   retryAfterSeconds?: number;
 };
 
 export class NoAvailableAccountsError extends AppError {
   constructor(readonly availability: AccountAvailability) {
+    // An empty balance is a different story from a pool that is down: the
+    // client cannot fix it, but a top-up or a new account can, and the 429
+    // spelling is what clients already treat as "retry later".
+    const outOfCredits = availability.available === 0 && availability.quotaBlocked > 0;
     super(
-      503,
-      'no_available_account',
-      'No WorkBuddy account is currently available; retry later or sign in again.',
+      outOfCredits ? 429 : 503,
+      outOfCredits ? 'insufficient_quota' : 'no_available_account',
+      outOfCredits
+        ? 'Every WorkBuddy account is out of credits; top up a balance or import another account.'
+        : 'No WorkBuddy account is currently available; retry later or sign in again.',
     );
     this.name = 'NoAvailableAccountsError';
     this.retryAfterSeconds = availability.retryAfterSeconds;

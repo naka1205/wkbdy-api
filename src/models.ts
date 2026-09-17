@@ -97,3 +97,14 @@ export function resolvedContextWindow(model: StoredModel, requested?: number): n
   if (selected !== undefined) return selected;
   return DEFAULT_CONTEXT_WINDOW;
 }
+
+/**
+ * Whether the upstream charges credits for this model. WorkBuddy advertises
+ * the price as `x0.34 credits`, and `x0.00` models are free, so an account
+ * without a balance can still serve them. Unknown metadata counts as paid:
+ * guessing "free" would let an empty account break paid requests.
+ */
+export function modelConsumesCredits(model: StoredModel | undefined): boolean {
+  const match = /x\s*(\d*\.?\d+)/i.exec(model?.x_workbuddy.credits ?? '');
+  return match ? Number(match[1]) > 0 : true;
+}

@@ -3,6 +3,7 @@ import type { UpstreamChatRequest } from './request.js';
 import { randomUUID } from 'node:crypto';
 import type { WorkBuddyCredential } from './credentials.js';
 import { dumpHeaders, type DumpSink } from './dump.js';
+import { isAccountBlocked, isQuotaFailure } from './errors.js';
 
 /** One normalized upstream chunk event, post-SSE parsing. */
 export type UpstreamChunk = {
@@ -60,7 +61,11 @@ export type IssuedCredential = WorkBuddyCredential & { accountId?: string; label
  */
 export type CredentialLike = {
   /** `apiKeyId` selects the sticky assignment when the pool pins keys. */
-  getCredential(apiKeyId?: string): Promise<IssuedCredential>;
+  getCredential(
+    apiKeyId?: string,
+    needsCredits?: boolean,
+    exclude?: ReadonlySet<string>,
+  ): Promise<IssuedCredential>;
   invalidate(): void;
   describe(): string;
   reportFailure?(credential: IssuedCredential): void;
@@ -153,10 +158,18 @@ export class WorkBuddyClient {
       requireDone?: boolean;
       /** Correlation ID echoed by the upstream as `x-request-id`. */
       requestId?: string;
+      /** Model charges credits: skip accounts whose balance ran out. */
+      needsCredits?: boolean;
+      /** Accounts that already failed this client call; the pool skips them. */
+      excludeAccounts?: ReadonlySet<string>;
     } = {},
   ): Promise<UpstreamStream> {
     const { apiKeyId, allowAuthRetry = true, requireDone = false, requestId } = options;
-    let credential = await this.opts.credentials.getCredential(apiKeyId);
+    let credential = await this.opts.credentials.getCredential(
+      apiKeyId,
+      options.needsCredits,
+      options.excludeAccounts,
+    );
     let res = await this.send(body, signal, credential, requestId);
     this.dumpResponse(res, credential, requestId, 'attempt-1');
     if (res.status === 401 && allowAuthRetry) {
@@ -169,14 +182,15 @@ export class WorkBuddyClient {
         }
       } else {
         this.opts.credentials.invalidate();
-        credential = await this.opts.credentials.getCredential(apiKeyId);
+        credential = await this.opts.credentials.getCredential(
+          apiKeyId,
+          options.needsCredits,
+          options.excludeAccounts,
+        );
       }
       res = await this.send(body, signal, credential, requestId);
       this.dumpResponse(res, credential, requestId, 'attempt-2');
     }
-    if (res.status === 401 || res.status === 403) this.opts.credentials.reportFailure?.(credential);
-    else if (res.status >= 500 || res.status === 429)
-      this.reportTransient(credential, `upstream ${res.status}`);
     if (res.status !== 200 || !res.body) {
       const text = await res.text().catch(() => '');
       this.dump?.write('upstream_error_body', {
@@ -188,6 +202,18 @@ export class WorkBuddyClient {
       });
       const parsedBody = safeJson(text);
       const fields = errorFields(parsedBody);
+      // A dead balance or a risk-control block is account-scoped and handled by
+      // the pool (quota parks the account for credit-consuming models only,
+      // blocked disables it). Counting them as transient strikes as well would
+      // quarantine the account for every model, free ones included.
+      const accountScoped =
+        isAccountBlocked(fields.code, fields.message) ||
+        isQuotaFailure(res.status, fields.code, fields.message);
+      if (!accountScoped) {
+        if (res.status === 401 || res.status === 403) this.opts.credentials.reportFailure?.(credential);
+        else if (res.status >= 500 || res.status === 429)
+          this.reportTransient(credential, `upstream ${res.status}`);
+      }
       throw new UpstreamHttpError(
         res.status,
         fields.code,
@@ -255,12 +281,24 @@ export class WorkBuddyClient {
       statusText: res.statusText,
       headers: dumpHeaders(res.headers),
     });
-    // Consume/discard whatever came back so the socket is released.
-    await res.body?.cancel().catch(() => {});
-    if (res.status === 200) return;
+    if (res.status === 200) {
+      // Consume/discard whatever came back so the socket is released.
+      await res.body?.cancel().catch(() => {});
+      return;
+    }
+    // Read the failure body *before* releasing the socket, otherwise the
+    // panel only ever shows "upstream 429" and the real reason is lost.
     const text = await res.text().catch(() => '');
-    const fields = errorFields(safeJson(text));
-    throw new UpstreamHttpError(res.status, fields.code, fields.message ?? text.slice(0, 300));
+    const parsed = safeJson(text);
+    const fields = errorFields(parsed);
+    throw new UpstreamHttpError(
+      res.status,
+      fields.code,
+      fields.message ?? text.slice(0, 300),
+      res.headers.get('retry-after') ?? undefined,
+      res.headers.get('x-request-id') ??
+        (typeof parsed?.requestId === 'string' ? parsed.requestId : undefined),
+    );
   }
 
   /**

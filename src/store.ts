@@ -34,6 +34,16 @@ export const accountPatch = z
 
 export type AccountInput = z.input<typeof accountInput>;
 
+/** Why an account is out of rotation; drives the cooldown policy per cause. */
+export type CooldownReason = 'quota' | 'transient' | 'auth' | 'blocked';
+
+/**
+ * How far an empty balance reaches: WorkBuddy charges credits for paid models
+ * and still answered "Credits exhausted" for a free one, so a failure on a free
+ * model means the account cannot serve anything until it is topped up.
+ */
+export type QuotaScope = 'credits' | 'account';
+
 export interface Account {
   id: string;
   name: string;
@@ -55,6 +65,15 @@ export interface Account {
   credits: number;
   /** Set when the upstream reported this account out of credits. */
   quotaExhaustedAt: number | null;
+  /** Why the account is out of rotation: quota, transient, auth or blocked. */
+  cooldownReason: CooldownReason | null;
+  /**
+   * When a credit-consuming model may probe a quota-exhausted account again.
+   * Free models ignore the quota gate, so this never blocks them.
+   */
+  quotaRetryAfter: number | null;
+  /** `credits`: only paid models skip it. `account`: every model does. */
+  quotaScope: QuotaScope | null;
   lastError: string | null;
   lastUsedAt: number | null;
   createdAt: string;
@@ -153,6 +172,9 @@ function toAccount(row: AccountRow): Account {
     tokens: row.tokens ?? 0,
     credits: row.credits ?? 0,
     quotaExhaustedAt: row.quota_exhausted_at ?? null,
+    cooldownReason: row.cooldown_reason ?? null,
+    quotaRetryAfter: row.quota_retry_after ?? null,
+    quotaScope: row.quota_scope ?? null,
     lastError: row.last_error ?? null,
     lastUsedAt: row.last_used_at ?? null,
     createdAt: row.created_at,
@@ -161,6 +183,23 @@ function toAccount(row: AccountRow): Account {
 }
 
 const lastFour = (value: string) => (value.length > 4 ? value.slice(-4) : value);
+
+/**
+ * A credit-consuming model must skip an account whose balance ran out until
+ * the probe window ends. Free models (`x0.00`) never consult this.
+ */
+export function isQuotaBlocked(account: Account, needsCredits: boolean, now: number = Date.now()): boolean {
+  if (account.quotaExhaustedAt === null || (account.quotaRetryAfter ?? 0) <= now) return false;
+  return account.quotaScope === 'account' || needsCredits;
+}
+
+/** When the account may serve the caller's model again. */
+export function cooldownUntil(account: Account, needsCredits: boolean, now: number = Date.now()): number {
+  return Math.max(
+    account.quarantinedUntil,
+    isQuotaBlocked(account, needsCredits, now) ? account.quotaRetryAfter! : 0,
+  );
+}
 
 export class Store {
   readonly events = new EventEmitter();
@@ -276,6 +315,7 @@ export class Store {
              oauth_origin=COALESCE(NULLIF(?,''), oauth_origin),
              source=?, expires_at=?, refresh_expires_at=?, enabled=1, needs_reauth=0, quarantined_until=0,
              consecutive_failures=0, last_error=NULL, quota_exhausted_at=NULL,
+             quota_retry_after=NULL, cooldown_reason=NULL,
              email=COALESCE(NULLIF(?,''), email),
              name=CASE WHEN ? <> '' THEN ? ELSE name END,
              note=CASE WHEN ? <> '' THEN ? ELSE note END
@@ -345,6 +385,7 @@ export class Store {
         // Re-enabling is an operator statement that the account is usable
         // again, so clear the "out of credits" flag too.
         sets.push('quarantined_until=0', 'consecutive_failures=0', 'quota_exhausted_at=NULL');
+        sets.push('quota_retry_after=NULL', 'quota_scope=NULL', 'cooldown_reason=NULL');
       }
     }
     if (!sets.length) return this.account(id);
@@ -412,15 +453,44 @@ export class Store {
     this.db
       .prepare(
         `UPDATE accounts SET consecutive_failures=0, quarantined_until=0, last_error=NULL,
-           quota_exhausted_at=NULL WHERE id=?`,
+           quota_exhausted_at=NULL, quota_retry_after=NULL, cooldown_reason=NULL WHERE id=?`,
       )
       .run(id);
   }
 
-  /** Out of credits: quarantine as usual and flag it for the panel. */
-  markQuotaExhausted(id: string, cooldownMs: number, error?: string): void {
-    this.reportFailure(id, cooldownMs, error ?? 'Upstream quota or balance is exhausted.');
-    this.db.prepare('UPDATE accounts SET quota_exhausted_at=? WHERE id=?').run(Date.now(), id);
+  /**
+   * The upstream says this account is out of credits. That is *not* a broken
+   * account: nothing about the credential is wrong, the balance is empty, so
+   * the row is parked for a probe window instead of collecting failure
+   * strikes. A topped-up account comes back on its own.
+   *
+   * `accountWide` records what the upstream actually told us: WorkBuddy
+   * answers code 14018 for free (`x0.00`) models too, so a quota reply seen on
+   * a free model parks the account for every model; a reply seen on a paid
+   * model parks it for the credit-consuming ones only. The scope is stored so
+   * a later probe that succeeds narrows it back.
+   */
+  markQuotaExhausted(
+    id: string,
+    retryMs: number,
+    error?: string,
+    options: { model?: string; accountWide?: boolean } = {},
+  ): void {
+    const now = Date.now();
+    const detail = error ?? 'Upstream quota or balance is exhausted.';
+    const { model } = options;
+    this.db
+      .prepare(
+        `UPDATE accounts SET quota_exhausted_at=?, quota_retry_after=?, cooldown_reason='quota',
+           quota_scope=?, last_error=? WHERE id=?`,
+      )
+      .run(
+        now,
+        now + retryMs,
+        options.accountWide ? 'account' : 'credits',
+        (model ? `${detail} (model: ${model})` : detail).slice(0, 300),
+        id,
+      );
   }
 
   /**
@@ -429,7 +499,7 @@ export class Store {
    */
   disableAccount(id: string, error?: string): void {
     this.db
-      .prepare('UPDATE accounts SET enabled=0, last_error=? WHERE id=?')
+      .prepare("UPDATE accounts SET enabled=0, cooldown_reason='blocked', last_error=? WHERE id=?")
       .run((error ?? 'Upstream blocked this account.').slice(0, 300), id);
     this.releaseBindingForAccount(id);
   }
@@ -440,7 +510,10 @@ export class Store {
     const failures = account.consecutiveFailures + 1;
     const backoff = Math.min(cooldownMs * 2 ** Math.min(failures - 1, 10), 30 * 60_000);
     this.db
-      .prepare('UPDATE accounts SET consecutive_failures=?, quarantined_until=?, last_error=? WHERE id=?')
+      .prepare(
+        `UPDATE accounts SET consecutive_failures=?, quarantined_until=?, cooldown_reason='transient',
+           last_error=? WHERE id=?`,
+      )
       .run(failures, Date.now() + backoff, error?.slice(0, 300) ?? account.lastError, id);
     // A quarantined account cannot serve its key, so the assignment is dropped
     // and the next request picks a healthy account instead of failing.
@@ -461,34 +534,50 @@ export class Store {
       return;
     }
     this.db
-      .prepare('UPDATE accounts SET consecutive_failures=?, last_error=? WHERE id=?')
+      .prepare(
+        "UPDATE accounts SET consecutive_failures=?, cooldown_reason='transient', last_error=? WHERE id=?",
+      )
       .run(failures, error?.slice(0, 300) ?? account.lastError, id);
   }
 
   markReauth(id: string, error?: string): void {
     this.db
-      .prepare('UPDATE accounts SET needs_reauth=1, last_error=? WHERE id=?')
+      .prepare("UPDATE accounts SET needs_reauth=1, cooldown_reason='auth', last_error=? WHERE id=?")
       .run(error?.slice(0, 300) ?? 'Account needs a new web login.', id);
     this.releaseBindingForAccount(id);
   }
 
-  availability(): AccountAvailability {
+  /**
+   * Pool state for the client-facing error. `needsCredits` expands the pool
+   * view to the way a credit-consuming model sees it: accounts whose balance
+   * ran out are unavailable there, while free models can still use them.
+   */
+  availability(needsCredits = false): AccountAvailability {
     const now = Date.now();
     const accounts = this.accounts();
     const disabled = accounts.filter((account) => !account.enabled).length;
     const needsReauth = accounts.filter((account) => account.enabled && account.needsReauth).length;
-    const cooling = accounts.filter(
-      (account) => account.enabled && !account.needsReauth && account.quarantinedUntil > now,
+    const live = accounts.filter((account) => account.enabled && !account.needsReauth);
+    const cooling = live.filter((account) => account.quarantinedUntil > now);
+    const quotaBlocked = live.filter(
+      (account) => isQuotaBlocked(account, needsCredits, now) && account.quarantinedUntil <= now,
     );
-    const retryAfterSeconds = cooling.length
-      ? Math.max(1, Math.ceil((Math.min(...cooling.map((account) => account.quarantinedUntil)) - now) / 1000))
+    const parked = [...cooling, ...quotaBlocked];
+    const retryAfterSeconds = parked.length
+      ? Math.max(
+          1,
+          Math.ceil(
+            (Math.min(...parked.map((account) => cooldownUntil(account, needsCredits, now))) - now) / 1000,
+          ),
+        )
       : undefined;
     return {
       total: accounts.length,
       disabled,
       needsReauth,
       coolingDown: cooling.length,
-      available: accounts.length - disabled - needsReauth - cooling.length,
+      quotaBlocked: quotaBlocked.length,
+      available: accounts.length - disabled - needsReauth - parked.length,
       ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
     };
   }

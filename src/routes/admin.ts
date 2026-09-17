@@ -2,7 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Auth } from '../auth.js';
-import { AppError, redactError } from '../errors.js';
+import { AppError, isAccountBlocked, isQuotaFailure, redactError } from '../errors.js';
 import { LocalImportError, readLocalWorkBuddyAccounts } from '../import.js';
 import { OAuthError, type OAuthBroker } from '../oauth.js';
 import { settingsSchema } from '../config.js';
@@ -11,7 +11,7 @@ import { stripBearer, tokenClaims } from '../credentials.js';
 import { ConfigParseError, parseProductConfig, toExposedModel } from '../catalog.js';
 import { fromExposed } from '../models.js';
 import type { Accounts } from '../accounts.js';
-import type { WorkBuddyClient } from '../upstream.js';
+import { UpstreamHttpError, type WorkBuddyClient } from '../upstream.js';
 
 export type AdminOptions = {
   auth: Auth;
@@ -221,7 +221,19 @@ export function adminRoutes(app: FastifyInstance, opts: AdminOptions): void {
         return { ok: true, detail: 'Upstream accepted the credential.' };
       } catch (error) {
         const message = redactError(verificationMessage(error));
-        store.reportFailure(credential.id, 0, message);
+        // A rejected probe must land in the same bucket as a rejected chat:
+        // an empty balance parks the account for a probe window, a risk-control
+        // block disables it. Only real trouble counts as a transient strike.
+        if (error instanceof UpstreamHttpError && isAccountBlocked(error.code, error.upstreamMessage)) {
+          opts.accounts.reportBlocked(credential.id, message);
+        } else if (
+          error instanceof UpstreamHttpError &&
+          isQuotaFailure(error.status, error.code, error.upstreamMessage)
+        ) {
+          opts.accounts.reportQuotaExhausted(credential.id, message, { accountWide: true });
+        } else {
+          store.reportFailure(credential.id, 0, message);
+        }
         return { ok: false, detail: message };
       }
     },

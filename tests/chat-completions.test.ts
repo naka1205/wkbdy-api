@@ -253,8 +253,10 @@ test('upstream rate limits and quota failures keep their meaning', async (t) => 
   const quota = await post(context, { model: 'deepseek-v4.1-flash', messages });
   assert.equal(quota.statusCode, 429);
   assert.equal(quota.json<{ error: { code: string } }>().error.code, 'insufficient_quota');
-  // An exhausted account leaves the rotation so the next retry can pick another.
+  // The upstream rejected a zero-cost model as well, so the account is parked
+  // for every model until the balance is topped up.
   assert.equal(context.store.availability().available, 0);
+  assert.equal(context.store.availability().quotaBlocked, 1);
 });
 
 test('an exhausted account is swapped out mid-request, so the task survives', async (t) => {
@@ -284,8 +286,12 @@ test('an exhausted account is swapped out mid-request, so the task survives', as
     ['user-1', 'user-2'],
   );
   const retired = context.store.accounts().find((account) => account.userId === 'user-1')!;
-  assert.ok(retired.quarantinedUntil > Date.now());
+  // An empty balance parks the account for credit-consuming models only, so the
+  // free model that just ran is not the reason it left this request.
+  assert.ok(retired.quotaExhaustedAt !== null);
+  assert.ok(retired.quotaRetryAfter! > Date.now());
   assert.equal(context.store.availability().available, 1);
+  assert.equal(context.store.availability(true).available, 1);
 });
 
 test('the original account error surfaces when no spare account is left', async (t) => {
@@ -298,6 +304,51 @@ test('the original account error surfaces when no spare account is left', async 
   assert.equal(response.headers['retry-after'], '1');
   assert.equal(body.error.retryable, true);
   assert.equal(body.error.retry_after, 1);
+});
+
+test('exhausting credits on a paid model leaves free models working', async (t) => {
+  const context = await fixture(t);
+  const accountId = context.store.accounts()[0]!.id;
+  context.upstream.handler = () => json({ error: { data: { code: 14018, msg: 'Credits exhausted.' } } }, 429);
+
+  const paid = await post(context, { model: 'gpt-5.6-sol', messages });
+  assert.equal(paid.statusCode, 429);
+  assert.equal(paid.json<{ error: { code: string } }>().error.code, 'insufficient_quota');
+  assert.ok(context.store.account(accountId)!.quotaExhaustedAt !== null);
+  // The account is only parked for credit-consuming models.
+  assert.equal(context.store.account(accountId)!.quarantinedUntil, 0);
+  assert.equal(context.store.availability().available, 1);
+  assert.equal(context.store.availability(true).available, 0);
+
+  context.upstream.handler = () => sse(streamPayload);
+  const free = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(free.statusCode, 200);
+  // Serving a free model proves the account works, so the red flag clears.
+  assert.equal(context.store.account(accountId)!.quotaExhaustedAt, null);
+  assert.equal(context.store.account(accountId)!.cooldownReason, null);
+});
+
+test('a quota reply on a free model parks the account for every model', async (t) => {
+  const context = await fixture(t);
+  context.upstream.handler = () => json({ error: { data: { code: 14018, msg: 'Credits exhausted.' } } }, 429);
+
+  const free = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(free.statusCode, 429);
+  // The upstream rejected a zero-cost model too, so the account is out for
+  // everything, not just for paid models.
+  const parked = context.store.accounts()[0]!;
+  assert.equal(parked.quotaScope, 'account');
+  assert.equal(context.store.availability(true).available, 0);
+  assert.equal(context.store.availability().available, 0);
+
+  const attempts = context.upstream.calls.length;
+  const after = await post(context, { model: 'deepseek-v4.1-flash', messages });
+  assert.equal(after.statusCode, 429);
+  assert.equal(
+    context.upstream.calls.length,
+    attempts,
+    'a parked account is not probed again inside the retry window',
+  );
 });
 
 test('a risk-control block disables the account instead of retrying it', async (t) => {

@@ -147,7 +147,28 @@ export function openDatabase(dataDir: string): Database.Database {
     // the credit number red and any successful call clears it again.
     if (!accountColumns.includes('quota_exhausted_at'))
       db.exec('ALTER TABLE accounts ADD COLUMN quota_exhausted_at INTEGER');
-    db.pragma('user_version = 10');
+    // Why the account is out of rotation (`quota` / `transient` / `auth` /
+    // `blocked`). Quota is model-scoped and must not look like a hard failure.
+    if (!accountColumns.includes('cooldown_reason')) {
+      db.exec('ALTER TABLE accounts ADD COLUMN cooldown_reason TEXT');
+      // Older rows parked an out-of-credits account with the generic
+      // (account-wide) quarantine and inflated failure counters. The cooldown
+      // is model-scoped now, so release those stale parks: the next paid
+      // request probes each account once and re-parks it if it is still empty.
+      db.exec(
+        "UPDATE accounts SET quarantined_until=0, consecutive_failures=0, cooldown_reason='quota' WHERE quota_exhausted_at IS NOT NULL",
+      );
+    }
+    // When a credit-consuming model may probe this account again after an
+    // upstream "out of credits" reply. Free models ignore it entirely.
+    if (!accountColumns.includes('quota_retry_after'))
+      db.exec('ALTER TABLE accounts ADD COLUMN quota_retry_after INTEGER');
+    // Whether the empty balance blocks every model (`account`) or only the
+    // credit-consuming ones (`credits`). WorkBuddy answered "Credits
+    // exhausted" for free models too, so the scope follows the model that hit
+    // the limit instead of being assumed.
+    if (!accountColumns.includes('quota_scope')) db.exec('ALTER TABLE accounts ADD COLUMN quota_scope TEXT');
+    db.pragma('user_version = 11');
   })();
   return db;
 }

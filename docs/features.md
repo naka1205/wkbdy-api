@@ -72,6 +72,8 @@
 
 `credits` 取自上游 `usage.credit`（WorkBuddy 自己的计费单位，与 Token 用量无关，免费账号为 0），只写入日志与统计（`stats.credits24h`），不会出现在返回给客户端的 `usage` 里。同一个值也按账号累加到 `accounts.credits`，账号列表直接显示每个账号的累计积分消耗（上游说该账号额度耗尽时 `quota_exhausted_at` 会被写入，面板把数字显示成红色，成功一次即清除）；`/v1/chat/completions` 与 `/v1/responses` 都会累加请求数、Token 与积分（Responses 走的是 Codex 流量，早先漏记，现已在成功、非流式与流式两条路径都补上）。
 
+暂停原因写在同一行账号记录里，面板按原因显示不同的状态徽标：`cooldown_reason=quota`（额度耗尽，`quota_retry_after` 到期后自动探测，充值即恢复）、`transient`（上游 5xx / 连接失败 / 普通 429 限流 / 超时，累计 3 次才指数退避）、`auth`（令牌被拒，需要重新网页登录）、`blocked`（上游封控，已自动停用）。额度耗尽不再计入失败次数，也不会把账号整体隔离——上游对免费（`x0.00`）模型同样回 `14018`，此时 `quota_scope=account`，充值后随探测自动恢复。
+
 - 关联字段：客户端提交的 `task_id`、`session_id`、`trace_id`、`client_request_id`、`logical_request_id`、`client_attempt`，以及上游回显的 `upstream_request_id`；请求头契约见[重试与关联 ID](retry-policy.md)。
 - 保留策略：`logging.retentionDays`（默认 30 天）与 `logging.maxEntries`（默认 50000 条），由定时任务清理。
 - `/api/admin/logs` 支持 `limit`、`offset`、`model`、`status`、`apiKeyId`、`taskId`、`logicalRequestId` 过滤。

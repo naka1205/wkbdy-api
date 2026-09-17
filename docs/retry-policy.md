@@ -11,7 +11,7 @@
 | 上游 5xx、连接失败、SSE 解析失败 | 429 + `Retry-After`（上游未给出时默认 1 秒）                           | 前 3 次只计数；第 3 次起按 `pool.cooldownSeconds` 指数退避暂停 |
 | 上游超时                         | 429 `upstream_timeout` + `Retry-After`                                 | 同上                                                           |
 | 普通上游限流（429）              | 429 `rate_limit_exceeded` + `Retry-After`                              | 同上                                                           |
-| 明确额度/余额不足                | 先自动换号重试；池内无可用账号时回 429 `insufficient_quota`            | 立即退役该账号并释放占号                                       |
+| 明确额度/余额不足                | 先自动换号重试；池内无可用账号时回 429 `insufficient_quota`            | 按 `pool.quotaRetrySeconds` 暂停（不记失败次数），到期自动探测 |
 | 账号令牌被上游拒绝（401/403）    | 先自动换号重试；池内无可用账号时回 429 `upstream_authentication_error` | 立即暂停；`oauth` 账号先刷新同一账号重试一次                   |
 | 上游封控该账号（如 `410004`）    | 先自动换号重试；池内无可用账号时回 429 `upstream_error`                | **直接停用该账号**，需在面板重新启用；占号立即释放             |
 | 上游 4xx 且属于请求本身问题      | 400 `invalid_request`（原样透出上游消息）                              | 与账号无关，不暂停                                             |
@@ -21,7 +21,10 @@
 
 要点：
 
-- 额度耗尽会打上 `quota_exhausted_at` 标记（面板把该账号的积分显示为红色），任意一次成功请求或面板重新启用都会清除它；封控（`410004` / 「账号已被封控」等消息）不做冷却重试，而是把账号 `enabled` 置 0，避免反复撞墙。
+- **暂停原因是独立字段**，面板与日志都能区分：`cooldown_reason` 取 `quota`（额度耗尽）、`transient`（上游 5xx / 连接失败 / 普通 429 限流 / 超时）、`auth`（令牌被拒需重新登录）、`blocked`（上游封控已停用）。同一张表还记录 `quota_retry_after`（探测时间）与 `quota_scope`（`credits` 只挡计费模型，`account` 所有模型都挡）。
+- 额度耗尽**不记失败次数、不进入指数退避**，因为它不是坏账号：只按 `quota_retry_after` 暂停，到期后放行探测；任意一次成功请求或面板重新启用都会清除 `quota_exhausted_at` / `cooldown_reason`。上游对免费（`x0.00`）模型同样会回 `14018 Credits exhausted`，这种情况下 `quota_scope` 记为 `account`，等充值后统一恢复。
+- 普通限流与负载（上游 429 但没有额度字样）走 `transient`：先只计数，连续 3 次才按指数退避暂停，避免把一次上游抖动当成账号故障。
+- 封控（`410004` / 「账号已被封控」等消息）不做冷却重试，而是把账号 `enabled` 置 0，避免反复撞墙。
 - **账号级失败会在同一次客户端请求内换号重试**（额度耗尽、令牌被拒、账号被封，最多 3 个账号）：客户端不会因为池里某一个账号没额度就中断整个任务。只有池内没有可用账号时，失败才会回给客户端，且此时回的是第一个失败账号的错误（例如 `insufficient_quota`），不是笼统的「无可用账号」。
 - 可重试的错误体同时带 `error.retryable: true` 与 `error.retry_after`，响应头带 `Retry-After`；`/v1/chat/completions` 与 `/v1/responses` 行为一致（流式提交后的错误帧同样带这两个字段）。
 - 上游 `Retry-After` 会被解析（秒数或 HTTP 日期，上限 86400 秒）并原样回传；错误体同时带 `error.retry_after`。上游没给时，可重试的失败默认给 1 秒，避免客户端立刻打回。

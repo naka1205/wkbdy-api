@@ -1,7 +1,7 @@
 import { CredentialError, stripBearer, tokenClaims, type WorkBuddyCredential } from './credentials.js';
 import { NoAvailableAccountsError } from './errors.js';
 import type { IssuedCredential } from './upstream.js';
-import type { Account, Store } from './store.js';
+import { isQuotaBlocked, type Account, type Store } from './store.js';
 
 export type Refresher = (credential: WorkBuddyCredential) => Promise<WorkBuddyCredential>;
 
@@ -34,6 +34,10 @@ export type PoolAccountView = {
   credits: number;
   /** The upstream reported this account out of credits; the panel shows red. */
   quota_exhausted: boolean;
+  /** Why the account is parked: quota, transient, auth or blocked. */
+  cooldown_reason: string | null;
+  /** When a quota-parked account is probed again, in epoch milliseconds. */
+  quota_retry_after: number | null;
   last_error: string | null;
   last_used_at: number | null;
   /** Client key that currently keeps this account, when key pinning is on. */
@@ -74,48 +78,63 @@ export class Accounts {
     const now = Date.now();
     const owners = new Map(this.store.bindings().map((binding) => [binding.accountId, binding.apiKeyId]));
     const keyNames = new Map(this.store.keys().map((key) => [key.id, key.name]));
-    return this.store.accounts().map((account) => ({
-      id: account.id,
-      name: account.name,
-      note: account.note,
-      source: account.source,
-      user_id: account.userId,
-      domain: account.domain,
-      email: account.email,
-      ok: account.enabled && !account.needsReauth && account.quarantinedUntil <= now,
-      enabled: account.enabled,
-      detail: !account.source
-        ? '已导入凭据'
-        : account.needsReauth
-          ? '需要重新网页登录'
-          : account.source === 'oauth'
-            ? '网页登录'
-            : account.source === 'import'
-              ? '本机凭据导入'
-              : account.source === 'env'
-                ? '环境变量导入'
-                : '手动令牌',
-      needs_reauth: account.needsReauth,
-      expires_at: account.expiresAt,
-      ...(account.quarantinedUntil > now ? { quarantine_until: account.quarantinedUntil } : {}),
-      consecutive_failures: account.consecutiveFailures,
-      requests: account.requests,
-      tokens: account.tokens,
-      credits: account.credits,
-      quota_exhausted: account.quotaExhaustedAt !== null,
-      last_error: account.lastError,
-      last_used_at: account.lastUsedAt,
-      bound_key_id: owners.get(account.id) ?? null,
-      bound_key_name: owners.get(account.id) ? (keyNames.get(owners.get(account.id)!) ?? null) : null,
-    }));
+    return this.store.accounts().map((account) => {
+      const quotaParked = account.cooldownReason === 'quota' && (account.quotaRetryAfter ?? 0) > now;
+      return {
+        id: account.id,
+        name: account.name,
+        note: account.note,
+        source: account.source,
+        user_id: account.userId,
+        domain: account.domain,
+        email: account.email,
+        ok: account.enabled && !account.needsReauth && account.quarantinedUntil <= now && !quotaParked,
+        enabled: account.enabled,
+        detail: !account.source
+          ? '已导入凭据'
+          : account.needsReauth
+            ? '需要重新网页登录'
+            : account.source === 'oauth'
+              ? '网页登录'
+              : account.source === 'import'
+                ? '本机凭据导入'
+                : account.source === 'env'
+                  ? '环境变量导入'
+                  : '手动令牌',
+        needs_reauth: account.needsReauth,
+        expires_at: account.expiresAt,
+        ...(account.quarantinedUntil > now ? { quarantine_until: account.quarantinedUntil } : {}),
+        consecutive_failures: account.consecutiveFailures,
+        requests: account.requests,
+        tokens: account.tokens,
+        credits: account.credits,
+        quota_exhausted: account.quotaExhaustedAt !== null,
+        cooldown_reason: account.cooldownReason,
+        quota_retry_after: account.quotaRetryAfter,
+        last_error: account.lastError,
+        last_used_at: account.lastUsedAt,
+        bound_key_id: owners.get(account.id) ?? null,
+        bound_key_name: owners.get(account.id) ? (keyNames.get(owners.get(account.id)!) ?? null) : null,
+      };
+    });
   }
 
   /** Accounts that may serve a request right now. */
-  private usable(): Account[] {
+  private usable(needsCredits: boolean, exclude?: ReadonlySet<string>): Account[] {
     const now = Date.now();
-    return this.store
+    const candidates = this.store
       .accounts()
-      .filter((account) => account.enabled && !account.needsReauth && account.quarantinedUntil <= now);
+      .filter(
+        (account) =>
+          account.enabled &&
+          !account.needsReauth &&
+          account.quarantinedUntil <= now &&
+          !isQuotaBlocked(account, needsCredits, now),
+      );
+    // Accounts that already failed this client call are skipped, so a retry
+    // moves on instead of hammering the same one.
+    if (!exclude?.size) return candidates;
+    return candidates.filter((account) => !exclude.has(account.id));
   }
 
   /**
@@ -145,12 +164,24 @@ export class Accounts {
   }
 
   /** The account this key keeps, while it can still serve requests. */
-  private pinned(apiKeyId?: string): Account | undefined {
+  private pinned(
+    apiKeyId: string | undefined,
+    needsCredits: boolean,
+    exclude?: ReadonlySet<string>,
+  ): Account | undefined {
     if (!apiKeyId || this.store.settings().pool.accountBinding !== 'key') return undefined;
     const binding = this.store.binding(apiKeyId);
     if (!binding) return undefined;
     const account = this.store.account(binding.accountId);
-    if (account && account.enabled && !account.needsReauth && account.quarantinedUntil <= Date.now())
+    const now = Date.now();
+    if (
+      account &&
+      account.enabled &&
+      !account.needsReauth &&
+      account.quarantinedUntil <= now &&
+      !exclude?.has(account.id) &&
+      !isQuotaBlocked(account, needsCredits, now)
+    )
       return account;
     // Disabled, signed out, quarantined or deleted: release so the next pick wins.
     this.store.releaseBindingForKey(apiKeyId);
@@ -163,8 +194,26 @@ export class Accounts {
     this.store.bindAccount(apiKeyId, accountId);
   }
 
-  async getCredential(apiKeyId?: string): Promise<IssuedCredential> {
-    const pinned = this.pinned(apiKeyId);
+  /**
+   * `needsCredits` marks a model the upstream charges credits for. Such a
+   * model steps over accounts whose balance ran out, while a free model keeps
+   * using them — an empty balance must not take an account out of the pool.
+   * `exclude` carries the accounts that already failed this client call.
+   */
+  async getCredential(
+    apiKeyId?: string,
+    needsCredits = false,
+    exclude?: ReadonlySet<string>,
+  ): Promise<IssuedCredential> {
+    return this.pickCredential(apiKeyId, needsCredits, exclude);
+  }
+
+  private async pickCredential(
+    apiKeyId: string | undefined,
+    needsCredits: boolean,
+    exclude?: ReadonlySet<string>,
+  ): Promise<IssuedCredential> {
+    const pinned = this.pinned(apiKeyId, needsCredits, exclude);
     if (pinned) {
       try {
         return await this.resolve(pinned.id);
@@ -172,8 +221,8 @@ export class Accounts {
         this.store.releaseBindingForAccount(pinned.id);
       }
     }
-    const usable = this.usable();
-    if (!usable.length) throw new NoAvailableAccountsError(this.store.availability());
+    const usable = this.usable(needsCredits, exclude);
+    if (!usable.length) throw new NoAvailableAccountsError(this.store.availability(needsCredits));
     const candidates = this.order(usable);
     let lastError: unknown;
     for (const account of candidates) {
@@ -186,7 +235,7 @@ export class Accounts {
       }
     }
     if (lastError instanceof NoAvailableAccountsError) throw lastError;
-    throw new NoAvailableAccountsError(this.store.availability());
+    throw new NoAvailableAccountsError(this.store.availability(needsCredits));
   }
 
   private async resolve(accountId: string): Promise<IssuedCredential> {
@@ -270,9 +319,18 @@ export class Accounts {
   }
 
   /** The upstream says this account is out of credits. */
-  reportQuotaExhausted(accountId: string | undefined, message?: string): void {
+  reportQuotaExhausted(
+    accountId: string | undefined,
+    message?: string,
+    options: { model?: string; accountWide?: boolean } = {},
+  ): void {
     if (!accountId) return;
-    this.store.markQuotaExhausted(accountId, this.cooldownMs(), message);
+    this.store.markQuotaExhausted(
+      accountId,
+      this.store.settings().pool.quotaRetrySeconds * 1000,
+      message,
+      options,
+    );
   }
 
   /** Upstream risk control: disable the account; waiting cannot fix it. */
