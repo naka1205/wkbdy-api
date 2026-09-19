@@ -164,15 +164,29 @@ export function mapResponsesRequest(
 ): ResponsesMapping {
   const messages: UpstreamChatRequest['messages'] = [];
   const collector: ToolCollector = { tools: [], custom: new Set(), ignored: [], seen: new Set() };
+  // One assistant turn is one upstream message. Codex emits a turn as an
+  // optional `message` item (the visible text) followed by its
+  // `function_call`/`custom_tool_call` items, so both have to land in the same
+  // assistant message: split into two messages the upstream answers either
+  // "the reasoning content from the previous turn must be passed back in
+  // thinking mode" (text message, then tool-call message) or "tool calls and
+  // tool results do not match" (each parallel call in its own message).
+  type ToolCall = { id: string; type: 'function'; function: { name: string; arguments: string } };
+  let pendingToolCalls: ToolCall[] | null = null;
+  // The assistant message a following tool call may still be attached to.
+  let openAssistant: { role: string; content: unknown; tool_calls?: ToolCall[] } | null = null;
   for (const tool of request.tools ?? []) addTool(tool, 'tools', collector);
   // The upstream requires messages[0] to be a system prompt.
   messages.push({ role: 'system', content: request.instructions ?? DEFAULT_SYSTEM_PROMPT });
 
   const pushMessage = (role: string, content: unknown, path: string) => {
-    messages.push({
+    pendingToolCalls = null;
+    const message = {
       role: role === 'developer' ? 'system' : role,
       content: messageText(content, path, collector.ignored),
-    });
+    };
+    messages.push(message);
+    openAssistant = message.role === 'assistant' ? message : null;
   };
 
   if (typeof request.input === 'string') {
@@ -207,11 +221,24 @@ export function mapResponsesRequest(
               : typeof item.arguments === 'string'
                 ? item.arguments
                 : JSON.stringify(item.arguments ?? {});
-          messages.push({
-            role: 'assistant',
-            content: '',
-            tool_calls: [{ id: item.call_id, type: 'function', function: { name, arguments: args } }],
-          } as UpstreamChatRequest['messages'][number]);
+          const call = {
+            id: item.call_id,
+            type: 'function' as const,
+            function: { name, arguments: args },
+          };
+          if (pendingToolCalls) {
+            pendingToolCalls.push(call);
+          } else if (openAssistant) {
+            // The text of this turn already opened the assistant message; the
+            // calls belong to it rather than to a second message.
+            openAssistant.tool_calls = [call];
+            pendingToolCalls = openAssistant.tool_calls;
+          } else {
+            const message = { role: 'assistant', content: '', tool_calls: [call] };
+            messages.push(message as UpstreamChatRequest['messages'][number]);
+            openAssistant = message;
+            pendingToolCalls = message.tool_calls;
+          }
           return;
         }
         case 'function_call_output':
@@ -231,6 +258,8 @@ export function mapResponsesRequest(
                 : typeof item.output === 'string'
                   ? item.output
                   : JSON.stringify(item.output ?? '');
+          pendingToolCalls = null;
+          openAssistant = null;
           messages.push({
             role: 'tool',
             content: output,

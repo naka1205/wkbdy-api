@@ -32,6 +32,7 @@ import {
   redactError,
 } from './errors.js';
 import { requestRecorder, type RequestOutcome } from './logging.js';
+import { sanitizeSystemPrompts } from './sanitize.js';
 import {
   applyCorrelation,
   correlationHeaders,
@@ -123,6 +124,14 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     const context_window = resolvedContextWindow(model, request.context_window);
     const needsCredits = modelConsumesCredits(model);
     const upstreamBody = toUpstreamRequest({ ...request, context_window });
+    // WorkBuddy blocks the system prompts of known third-party clients; a
+    // neutral rewrite keeps the turn alive. See sanitize.ts.
+    const rewritten = sanitizeSystemPrompts(upstreamBody.messages);
+    if (rewritten.length) {
+      notes.push(`rewrote client prompt fingerprints: ${rewritten.join(', ')}`);
+      note = notes.join('; ');
+      req.log.warn({ rules: rewritten }, 'sanitized system prompt before upstream');
+    }
     const abort = new AbortController();
     // Node fires 'close' on the request stream once the body is consumed —
     // before the response is sent. Watch the response stream instead: it

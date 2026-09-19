@@ -38,7 +38,22 @@
 
 上游封控（`410004` 或「账号已被封控」类消息）会**直接把账号停用**并释放占号——这类失败等待不会恢复，需要在面板里人工重新启用；账号级失败（额度耗尽、令牌被上游拒绝、账号被封）会在**同一次客户端请求内换号重试**，最多 3 个账号：占号账号不能用时自动退役并释放占号，请求落到下一个可用账号，客户端不会因为池里某一个账号没额度而中断任务。池内确实没有可用账号时，回的是第一个失败账号的错误（例如 `insufficient_quota`）而不是笼统的「无可用账号」。请求级失败（参数、模型、上游 4xx）不换号。
 
+### 客户端系统提示改写
+
+WorkBuddy 上游会按**系统提示内容**识别客户端：命中已知第三方客户端（Codex、Claude Code 等）的身份句时，直接回 `400 Illegal API invocation from an unapproved channel`，且这类失败与账号无关（换号无效）、客户端也不会重试，整个 agent 轮次会直接失败。
+
+上游的判定是对系统提示做子串精确匹配，且只检查 `system` 消息（用户消息里的同样文本不受影响）。因此网关在发给上游之前会把这几句身份描述改写成中性说法（`src/sanitize.ts`），developer / 用户内容原样保留；命中改写时请求日志的 `detail` 会记录 `rewrote client prompt fingerprints: <规则名>`，便于排查行为变化。
+
 对客户端而言，可重试的失败统一返回 429 + `Retry-After`，错误体同时带 `error.retryable` 与 `error.retry_after`；`/v1/chat/completions` 与 `/v1/responses`（含流式错误帧）行为一致。可重试的判定、关联请求头与日志字段见[重试与关联 ID](retry-policy.md)。
+
+## Responses → Chat Completions 映射
+
+`/v1/responses` 的 `input` 项会翻译成上游的 chat/completions 消息。核心规则是：**上游的一个 assistant 轮次 = 一条 assistant 消息**，拆开就会被拒。
+
+- 一轮里的多个 `function_call` / `custom_tool_call` 项合并成一条 assistant 消息的多个 `tool_calls`；拆成多条会得到 `400 tool calls and tool results do not match, please start a new conversation and retry`（第一个调用的结果不再紧跟它所回应的那条消息）。
+- 同一轮先出现的 assistant 文本 `message` 项与随后的工具调用**也合并到同一条消息**（`content` + `tool_calls`）；拆成"文本一条、工具调用一条"会得到 `400 the reasoning content from the previous turn must be passed back in thinking mode`——上游在 thinking 模式下会认为上一轮带思考的回复没有回传。
+- 中间的 `reasoning`（加密思考）与 `additional_tools` 项不产生消息，因此不会打断合并；`message` 与工具结果项会结束合并。
+- 同样的归一化也应用在 `/v1/chat/completions` 入口：客户端把一轮拆成"文本 + 工具调用"两条 assistant 消息时，网关会先合并再转发。
 
 ## 模型目录
 

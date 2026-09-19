@@ -197,8 +197,28 @@ export function normalizeMessages(messages: ChatRequest['messages']): UpstreamCh
     ...(m.tool_call_id !== undefined ? { tool_call_id: m.tool_call_id } : {}),
     ...(m.name !== undefined ? { name: m.name } : {}),
   }));
-  if (mapped.length === 0 || mapped[0]!.role !== 'system') {
-    return [{ role: 'system', content: DEFAULT_SYSTEM_PROMPT }, ...mapped];
+  // One assistant turn is one upstream message. A client that serialises the
+  // visible text and the tool calls of the same turn as two messages (some do)
+  // would otherwise be rejected by the upstream with "the reasoning content
+  // from the previous turn must be passed back in thinking mode" as soon as it
+  // declares tools, so fold the calls into the message they belong to.
+  const folded: typeof mapped = [];
+  for (const message of mapped) {
+    const previous = folded[folded.length - 1];
+    if (
+      previous?.role === 'assistant' &&
+      !previous.tool_calls?.length &&
+      message.role === 'assistant' &&
+      message.tool_calls?.length
+    ) {
+      previous.tool_calls = message.tool_calls;
+      if (!previous.content && message.content) previous.content = message.content;
+      continue;
+    }
+    folded.push(message);
   }
-  return mapped;
+  if (folded.length === 0 || folded[0]!.role !== 'system') {
+    return [{ role: 'system', content: DEFAULT_SYSTEM_PROMPT }, ...folded];
+  }
+  return folded;
 }

@@ -185,3 +185,30 @@ test('the aggregator builds a complete completion with usage', () => {
     completion_tokens_details: { reasoning_tokens: 3 },
   });
 });
+
+test('an assistant text message and its tool calls are folded into one message', () => {
+  const request = parse({
+    model: 'm',
+    messages: [
+      { role: 'system', content: 'system' },
+      { role: 'user', content: 'run ls' },
+      { role: 'assistant', content: 'Listing now.' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_00', type: 'function', function: { name: 'exec', arguments: '{}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_00', content: 'file1' },
+    ],
+  });
+  const messages = toUpstreamRequest(request).messages;
+  assert.deepEqual(
+    messages.map((message) => message.role),
+    ['system', 'user', 'assistant', 'tool'],
+  );
+  assert.equal(messages[2]!.content, 'Listing now.');
+  assert.deepEqual(
+    (messages[2] as unknown as { tool_calls: Array<{ id: string }> }).tool_calls.map((call) => call.id),
+    ['call_00'],
+  );
+});

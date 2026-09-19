@@ -21,6 +21,7 @@ import type { IssuedCredential, UpstreamChunk, WorkBuddyClient } from '../upstre
 import { modelConsumesCredits, resolvedContextWindow } from '../models.js';
 import type { Accounts } from '../accounts.js';
 import { requestRecorder, type RequestOutcome } from '../logging.js';
+import { sanitizeSystemPrompts } from '../sanitize.js';
 import {
   applyCorrelation,
   correlationHeaders,
@@ -164,6 +165,14 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
       req.log.warn({ ignored: mapped.ignored }, 'ignored unsupported responses items');
     }
     const upstream = mapped.upstream;
+    // WorkBuddy blocks the system prompts of known third-party clients; a
+    // neutral rewrite keeps the turn alive. See sanitize.ts.
+    const rewritten = sanitizeSystemPrompts(upstream.messages);
+    if (rewritten.length) {
+      notes.push(`rewrote client prompt fingerprints: ${rewritten.join(', ')}`);
+      note = notes.join('; ');
+      req.log.warn({ rules: rewritten }, 'sanitized system prompt before upstream');
+    }
 
     const abort = new AbortController();
     const onClose = () => {

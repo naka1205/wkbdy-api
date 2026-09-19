@@ -235,3 +235,96 @@ test('a malformed message item still reports its path', () => {
       /Unsupported/.test(error.message),
   );
 });
+
+test('parallel tool calls share one assistant message', () => {
+  const mapping = mapResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run both' }] },
+      { type: 'function_call', call_id: 'call_00', name: 'exec_command', arguments: '{"cmd":"ls"}' },
+      { type: 'function_call', call_id: 'call_01', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+      { type: 'function_call_output', call_id: 'call_00', output: 'file1' },
+      { type: 'function_call_output', call_id: 'call_01', output: '/tmp' },
+    ],
+  } as never);
+
+  // The upstream answers "tool calls and tool results do not match" when a
+  // parallel call is split into two assistant messages.
+  assert.deepEqual(
+    mapping.upstream.messages.map((message) => message.role),
+    ['system', 'user', 'assistant', 'tool', 'tool'],
+  );
+  const assistant = mapping.upstream.messages[2] as unknown as {
+    tool_calls: Array<{ id: string; function: { name: string } }>;
+  };
+  assert.deepEqual(
+    assistant.tool_calls.map((call) => call.id),
+    ['call_00', 'call_01'],
+  );
+});
+
+test('an assistant message between calls starts a new tool-call message', () => {
+  const mapping = mapResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'function_call', call_id: 'call_00', name: 'exec_command', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_00', output: 'ok' },
+      { type: 'function_call', call_id: 'call_01', name: 'exec_command', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_01', output: 'ok' },
+    ],
+  } as never);
+
+  assert.deepEqual(
+    mapping.upstream.messages.map((message) => message.role),
+    ['system', 'assistant', 'tool', 'assistant', 'tool'],
+  );
+});
+
+test('an assistant text message and its tool calls become one message', () => {
+  const mapping = mapResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'run ls' }] },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Listing now.' }] },
+      { type: 'function_call', call_id: 'call_00', name: 'exec_command', arguments: '{"cmd":"ls"}' },
+      { type: 'function_call', call_id: 'call_01', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+      { type: 'function_call_output', call_id: 'call_00', output: 'file1' },
+      { type: 'function_call_output', call_id: 'call_01', output: '/tmp' },
+    ],
+  } as never);
+
+  // Split into two assistant messages the upstream rejects the whole turn with
+  // "the reasoning content from the previous turn must be passed back".
+  assert.deepEqual(
+    mapping.upstream.messages.map((message) => message.role),
+    ['system', 'user', 'assistant', 'tool', 'tool'],
+  );
+  const assistant = mapping.upstream.messages[2] as unknown as {
+    content: string;
+    tool_calls: Array<{ id: string }>;
+  };
+  assert.equal(assistant.content, 'Listing now.');
+  assert.deepEqual(
+    assistant.tool_calls.map((call) => call.id),
+    ['call_00', 'call_01'],
+  );
+});
+
+test('a second assistant turn after tool results starts a new message', () => {
+  const mapping = mapResponsesRequest({
+    model: 'deepseek-v4.1-flash',
+    input: [
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first' }] },
+      { type: 'function_call', call_id: 'call_00', name: 'exec_command', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_00', output: 'ok' },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'second' }] },
+      { type: 'function_call', call_id: 'call_01', name: 'exec_command', arguments: '{}' },
+      { type: 'function_call_output', call_id: 'call_01', output: 'ok' },
+    ],
+  } as never);
+
+  assert.deepEqual(
+    mapping.upstream.messages.map((message) => message.role),
+    ['system', 'assistant', 'tool', 'assistant', 'tool'],
+  );
+});
