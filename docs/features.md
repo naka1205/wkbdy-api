@@ -57,7 +57,7 @@ WorkBuddy 上游会按**系统提示内容**识别客户端：命中已知第三
 
 ## 模型目录
 
-目录来自 WorkBuddy 产品配置（`config/wb_v3config.public.json`），导入后存于表结构：
+目录来自 WorkBuddy 产品配置接口（上游主机的 `/v3/config`，需要账号令牌），拉取后存于表结构：
 
 - `models`：名称、说明、Credits、默认标记、输入/输出上限、温度、图片/工具调用/推理能力、推理档位、上下文窗口默认值、是否启用、选定的上下文长度、排序。
 - `model_context_lengths` / `model_reasoning_efforts`：能力列表，保持原始顺序。
@@ -69,7 +69,7 @@ WorkBuddy 上游会按**系统提示内容**识别客户端：命中已知第三
 
 - 启用/停用任意模型（停用后从 `/v1/models` 消失，请求该模型返回 404）。
 - 上下文长度不做档位限制：客户端 `context_window` 按原值透传，未传时用面板选择，均未设置时用默认值 `1000000`（上游按模型能力收敛）。
-- 重新导入目录（`POST /api/admin/models/sync` 或 `npm run sync:catalog`），保留启停与上下文选择。
+- 重新拉取目录（`POST /api/admin/models/sync` 或 `npm run sync:catalog`），每次都实时请求上游接口，保留启停与上下文选择。
 
 ## 客户端 API Key
 

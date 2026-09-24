@@ -1,15 +1,13 @@
-import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Auth } from '../auth.js';
 import { AppError, isAccountBlocked, isQuotaFailure, redactError } from '../errors.js';
 import { LocalImportError, readLocalWorkBuddyAccounts } from '../import.js';
 import { OAuthError, type OAuthBroker } from '../oauth.js';
+import type { CatalogSyncSummary } from '../catalog-sync.js';
 import { settingsSchema } from '../config.js';
 import { accountInput, accountPatch, type Store } from '../store.js';
 import { stripBearer, tokenClaims } from '../credentials.js';
-import { ConfigParseError, parseProductConfig, toExposedModel } from '../catalog.js';
-import { fromExposed } from '../models.js';
 import type { Accounts } from '../accounts.js';
 import { UpstreamHttpError, type WorkBuddyClient } from '../upstream.js';
 
@@ -22,7 +20,10 @@ export type AdminOptions = {
   /** Version string reported by the panel and /health. */
   version: string;
   startedAt: number;
-  catalogPath: string;
+  /** Where the model catalog is fetched from, for the panel to display. */
+  catalogUrl: () => string;
+  /** Pull the product catalog from the upstream and merge it into the store. */
+  syncCatalog: () => Promise<CatalogSyncSummary>;
   credentialsPath?: string;
 };
 
@@ -87,7 +88,7 @@ export function adminRoutes(app: FastifyInstance, opts: AdminOptions): void {
     upstream: {
       url: store.settings().upstream.url,
       user_agent: store.settings().upstream.userAgent,
-      catalog_path: opts.catalogPath,
+      catalog_url: opts.catalogUrl(),
     },
     availability: store.availability(),
     pool: { size: opts.accounts.size, strategy: store.settings().strategy, accounts: opts.accounts.list() },
@@ -262,12 +263,17 @@ export function adminRoutes(app: FastifyInstance, opts: AdminOptions): void {
     models: store.models(),
     agents: store.catalog().agents,
     synced_at: store.catalog().syncedAt,
-    catalog_path: opts.catalogPath,
+    catalog_url: opts.catalogUrl(),
   }));
 
   app.post('/models/sync', { preHandler: auth.admin }, async () => {
-    const summary = await syncCatalog(opts.catalogPath, store);
-    return { ...summary, models: store.models(), synced_at: store.meta<string>('catalogSyncedAt') };
+    const summary = await opts.syncCatalog();
+    return {
+      ...summary,
+      models: store.models(),
+      synced_at: store.meta<string>('catalogSyncedAt'),
+      catalog_url: opts.catalogUrl(),
+    };
   });
 
   app.patch<{ Params: { id: string } }>('/models/:id', { preHandler: auth.admin }, async (request) => {
@@ -348,42 +354,6 @@ export function adminRoutes(app: FastifyInstance, opts: AdminOptions): void {
     const settings = store.saveSettings(settingsSchema.parse(request.body ?? {}));
     return { settings };
   });
-}
-
-/** Re-read the product catalog from disk and merge it into the model table. */
-export async function syncCatalog(catalogPath: string, store: Store) {
-  let raw: unknown;
-  try {
-    raw = JSON.parse(await readFile(catalogPath, 'utf8'));
-  } catch (error) {
-    throw new AppError(400, 'catalog_unreadable', `Cannot read the catalog file: ${catalogPath}`);
-  }
-  try {
-    const config = parseProductConfig(raw);
-    const known = new Set(config.data.models.map((model) => model.id));
-    for (const agent of config.data.agents) {
-      const unknown = agent.models.find((id) => !known.has(id));
-      if (unknown) {
-        throw new AppError(
-          400,
-          'catalog_invalid',
-          `Agent '${agent.name}' references unknown model '${unknown}'`,
-        );
-      }
-    }
-    return store.importCatalog({
-      models: config.data.models.map((model) => fromExposed(toExposedModel(model))),
-      agents: config.data.agents.map((agent) => ({
-        name: agent.name,
-        models: agent.models,
-        ...(agent.modelTags ? { modelTags: agent.modelTags } : {}),
-      })),
-      ...(config.data.endpoint ? { endpoint: config.data.endpoint } : {}),
-    });
-  } catch (error) {
-    if (error instanceof ConfigParseError) throw new AppError(400, 'catalog_invalid', error.message);
-    throw error;
-  }
 }
 
 function verificationMessage(error: unknown): string {

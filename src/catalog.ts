@@ -68,7 +68,21 @@ export function parseProductConfig(raw: unknown): ProductConfig {
     if (seen.has(m.id)) throw new ConfigParseError(`duplicate model id: ${m.id}`);
     seen.add(m.id);
   }
+  assertAgentReferences(parsed.data);
   return parsed.data;
+}
+
+/**
+ * Every agent must point at a model the payload defines. A dangling reference
+ * would silently drop the model from the client-visible catalog, so the import
+ * fails instead of writing a half-broken catalog.
+ */
+export function assertAgentReferences(config: ProductConfig): void {
+  const known = new Set(config.data.models.map((model) => model.id));
+  for (const agent of config.data.agents) {
+    const unknown = agent.models.find((id) => !known.has(id));
+    if (unknown) throw new ConfigParseError(`agent '${agent.name}' references unknown model '${unknown}'`);
+  }
 }
 
 export type ExposedModel = {

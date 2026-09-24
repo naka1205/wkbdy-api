@@ -21,7 +21,6 @@ const child = spawn(process.execPath, ['dist/index.js'], {
     PUBLIC_BASE_URL: base,
     DATA_DIR: dataDir,
     STATIC_DIR: join(process.cwd(), 'static'),
-    WKB2API_CATALOG_PATH: join(process.cwd(), 'config/wb_v3config.public.json'),
     ADMIN_PASSWORD: 'smoke-test-password',
     API_KEYS: 'sk-wk-smoke-test-key',
     LOG_LEVEL: 'silent',
@@ -55,8 +54,8 @@ try {
   });
   assert.equal(models.status, 200);
   const catalog = await models.json();
-  assert.ok(catalog.data.length > 0, 'the catalog file must seed /v1/models');
-  assert.ok(catalog.data.every((model) => model.object === 'model'));
+  // No account is configured, so the upstream catalog cannot be fetched yet.
+  assert.deepEqual(catalog.data, [], 'a pool without accounts exposes no models');
 
   const login = await fetch(`${base}/api/admin/auth/login`, {
     method: 'POST',
@@ -68,6 +67,13 @@ try {
   const accounts = await fetch(`${base}/api/admin/accounts`, { headers: { Cookie: cookie } });
   assert.deepEqual((await accounts.json()).accounts, []);
 
+  const sync = await fetch(`${base}/api/admin/models/sync`, {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-Admin-Request': '1' },
+  });
+  assert.equal(sync.status, 503, 'a catalog sync without accounts reports no_available_account');
+  assert.equal((await sync.json()).error.code, 'no_available_account');
+
   const home = await fetch(base);
   if (home.status === 200 && home.headers.get('content-type')?.includes('text/html')) {
     const html = await home.text();
@@ -78,7 +84,7 @@ try {
     console.log('Skipping admin asset checks: build wkbdy-api-admin with npm run build:deploy');
   }
 
-  console.log('Production smoke passed: compiled API, admin session, client key auth, catalog seeding.');
+  console.log('Production smoke passed: compiled API, admin session, client key auth, catalog sync.');
 } finally {
   if (child.exitCode === null) {
     const exited = once(child, 'exit');

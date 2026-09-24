@@ -1,9 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { json, fixture } from './helpers.js';
+import { catalogPayload, json, fixture } from './helpers.js';
 
 const token = (payload: Record<string, unknown>) =>
   `header.${Buffer.from(JSON.stringify(payload)).toString('base64url')}.signature`;
@@ -275,16 +272,28 @@ test('settings are read, validated and applied to scheduling', async (t) => {
   assert.equal(context.store.settings().strategy, 'random');
 });
 
-test('the catalog path is validated when reloading models', async (t) => {
-  const context = await fixture(t);
-  const dataDir = mkdtempSync(join(tmpdir(), 'wkbdy-admin-'));
-  const catalogPath = join(dataDir, 'catalog.json');
-  writeFileSync(catalogPath, JSON.stringify({ data: { models: [], agents: [] } }));
-  const broken = await context.app.inject({
+test('the panel reports the catalog endpoint it syncs from', async (t) => {
+  const context = await fixture(t, { catalog: false });
+  context.upstream.catalog = catalogPayload([{ id: 'alpha' }]);
+  const synced = await context.app.inject({
     method: 'POST',
     url: '/api/admin/models/sync',
     headers: context.headers,
   });
-  assert.equal(broken.statusCode, 200);
-  rmSync(dataDir, { recursive: true, force: true });
+  assert.equal(synced.statusCode, 200);
+  assert.equal(
+    synced.json<{ catalog_url: string }>().catalog_url,
+    'https://www.workbuddy.ai/v3/config',
+    'the URL is derived from the chat upstream',
+  );
+
+  const overview = await context.app.inject({
+    method: 'GET',
+    url: '/api/admin/overview',
+    headers: context.headers,
+  });
+  assert.equal(
+    overview.json<{ upstream: { catalog_url: string } }>().upstream.catalog_url,
+    'https://www.workbuddy.ai/v3/config',
+  );
 });

@@ -13,7 +13,6 @@ ENV NODE_ENV=production HOST=0.0.0.0 PORT=7891 DATA_DIR=/app/data STATIC_DIR=/ap
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json package-lock.json LICENSE ./
-COPY config/ ./config/
 COPY static/ ./static/
 RUN mkdir -p /app/data && chown -R node:node /app/data && chmod 700 /app/data
 USER node

@@ -15,7 +15,8 @@ import { Jobs } from './jobs.js';
 import { OAuthBroker } from './oauth.js';
 import { createDumpSink, dumpHeaders } from './dump.js';
 import { openAiError } from './openai/errors.js';
-import { adminRoutes, syncCatalog } from './routes/admin.js';
+import { adminRoutes } from './routes/admin.js';
+import { resolveCatalogUrl, syncCatalogFromUpstream } from './catalog-sync.js';
 import { modelsRoutes } from './routes/models.js';
 import { responsesRoutes } from './routes/responses.js';
 import { chatCompletionsRoutes } from './proxy.js';
@@ -71,15 +72,6 @@ export async function createServer(options: CreateServerOptions = {}) {
       store.addKey(`Initial key ${index + 1}`, key);
     store.setMeta('keysInitialized', true);
   }
-  if (!store.models().length) {
-    try {
-      await syncCatalog(env.catalogPath, store);
-    } catch (error) {
-      db.close();
-      throw new Error(`Cannot load the model catalog from ${env.catalogPath}: ${errorMessage(error)}`);
-    }
-  }
-
   const dump = createDumpSink(env.dumpDir, { redact: env.dumpRedact });
 
   const app = Fastify({
@@ -148,6 +140,26 @@ export async function createServer(options: CreateServerOptions = {}) {
     },
   });
   accounts.setRefresher((credential) => oauth.refreshCredential(credential));
+  const catalogUrl = () => resolveCatalogUrl(store.settings().upstream.url, env.catalogUrl);
+  const syncCatalog = () =>
+    syncCatalogFromUpstream({
+      store,
+      credentials: accounts,
+      catalogUrl,
+      userAgent: () => store.settings().upstream.userAgent,
+      ...(options.fetcher ? { fetchFn: options.fetcher } : {}),
+    });
+  // First boot: pull the catalog straight from the upstream, so a fresh install
+  // does not need a file or an operator click. Offline or account-less starts
+  // only log a warning — the panel's sync button retries on demand.
+  if (!store.models().length) {
+    try {
+      const summary = await syncCatalog();
+      app.log.info(`Model catalog loaded from ${catalogUrl()}: ${summary.added} models.`);
+    } catch (error) {
+      app.log.warn(`Could not load the model catalog from ${catalogUrl()}: ${errorMessage(error)}`);
+    }
+  }
   const jobs = new Jobs(store, oauth, (message, fields) => app.log.info(fields ?? {}, message));
 
   // Every response carries the gateway request ID, including the early 401s the
@@ -281,7 +293,8 @@ export async function createServer(options: CreateServerOptions = {}) {
     oauth,
     version,
     startedAt: Date.now(),
-    catalogPath: env.catalogPath,
+    catalogUrl,
+    syncCatalog,
     ...(env.credentialsPath ? { credentialsPath: env.credentialsPath } : {}),
   });
 

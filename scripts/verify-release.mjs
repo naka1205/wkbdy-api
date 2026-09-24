@@ -20,7 +20,7 @@ const forbidden = [
 const files = [
   'README.md',
   '.env.example',
-  'config/wb_v3config.public.json',
+  'tests/fixtures/catalog.json',
   'src/config.ts',
   'src/store.ts',
   'docs/configuration.md',
@@ -44,7 +44,7 @@ for (const name of [
   'PUBLIC_BASE_URL',
   'WKB2API_UPSTREAM_URL',
   'WKB2API_UPSTREAM_UA',
-  'WKB2API_CATALOG_PATH',
+  'WKB2API_CATALOG_URL',
   'WKB2API_CREDENTIALS_PATH',
   'TOKEN_ENCRYPTION_KEY',
 ]) {

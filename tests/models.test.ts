@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase } from '../src/db.js';
 import { Vault } from '../src/crypto.js';
 import { Store } from '../src/store.js';
 import { DEFAULT_CONTEXT_WINDOW, resolvedContextWindow } from '../src/models.js';
-import { syncCatalog } from '../src/routes/admin.js';
-import { bundledCatalog, fixture, writeCatalog } from './helpers.js';
+import { createServer } from '../src/server.js';
+import { MockUpstream, bundledCatalog, catalogPayload, fixture, testEnv } from './helpers.js';
 
 function storeFixture(t: { after: (fn: () => void) => void }) {
   const dataDir = mkdtempSync(join(tmpdir(), 'wkbdy-models-'));
@@ -49,42 +49,133 @@ test('context window resolution prefers the request, then the panel, then the 1M
   assert.equal(resolvedContextWindow(store.model(model.id)!), DEFAULT_CONTEXT_WINDOW);
 });
 
-test('catalog sync reads a product config file and records the sync time', async (t) => {
-  const { store, dataDir } = storeFixture(t);
-  const catalogPath = join(dataDir, 'catalog.json');
-  writeFileSync(
-    catalogPath,
-    JSON.stringify({
-      data: {
-        models: [
-          {
-            id: 'model-a',
-            name: 'Model A',
-            isDefault: true,
-            supportsToolCall: true,
-            maxOutputTokens: 4096,
-            contextWindow: { defaultLength: 200000, supportedLengths: [200000, 400000] },
-          },
-        ],
-        agents: [{ name: 'cli', models: ['model-a'] }],
-      },
-    }),
-  );
-  const summary = await syncCatalog(catalogPath, store);
-  assert.deepEqual({ added: summary.added, updated: summary.updated }, { added: 1, updated: 0 });
-  assert.equal(store.model('model-a')!.x_workbuddy.max_output_tokens, 4096);
-  assert.ok(store.meta<string>('catalogSyncedAt'));
+test('a panel sync pulls the product catalog from the upstream', async (t) => {
+  const context = await fixture(t, { catalog: false });
+  assert.deepEqual(context.store.models(), [], 'the model table starts empty');
+  context.upstream.catalog = catalogPayload([
+    { id: 'model-a', supportedLengths: [200000, 400000] },
+    { id: 'model-b' },
+  ]);
 
-  await assert.rejects(
-    () => syncCatalog(join(dataDir, 'missing.json'), store),
-    /Cannot read the catalog file/,
+  const synced = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(synced.statusCode, 200);
+  const body = synced.json<{ added: number; updated: number; removed: number; catalog_url: string }>();
+  assert.deepEqual(
+    { added: body.added, updated: body.updated, removed: body.removed },
+    { added: 2, updated: 0, removed: 0 },
+  );
+  assert.equal(body.catalog_url, 'https://www.workbuddy.ai/v3/config');
+  assert.deepEqual(
+    context.store
+      .models()
+      .map((model) => model.id)
+      .sort(),
+    ['model-a', 'model-b'],
+  );
+  assert.deepEqual(context.store.model('model-a')!.x_workbuddy.context_window, {
+    defaultLength: 200000,
+    supportedLengths: [200000, 400000],
+  });
+  assert.ok(context.store.meta<string>('catalogSyncedAt'));
+
+  // The catalog endpoint sits next to the chat endpoint and needs the account.
+  const call = context.upstream.calls.find((entry) => entry.url.endsWith('/v3/config'))!;
+  assert.equal(call.headers.get('authorization'), 'Bearer test-access-token-value');
+  assert.equal(call.headers.get('x-user-id'), 'user-1');
+  assert.equal(call.headers.get('x-domain'), 'www.workbuddy.ai');
+  assert.equal(call.headers.get('x-product'), 'SaaS');
+  assert.equal(call.headers.get('user-agent'), 'WorkBuddy/2.137.1');
+});
+
+test('a rejected catalog leaves the stored models untouched', async (t) => {
+  const context = await fixture(t, { catalog: false });
+  context.upstream.catalog = catalogPayload([{ id: 'alpha' }, { id: 'beta' }]);
+  const synced = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(synced.statusCode, 200);
+  const stored = () =>
+    context.store
+      .models()
+      .map((model) => model.id)
+      .sort();
+  assert.deepEqual(stored(), ['alpha', 'beta']);
+
+  // A dangling agent reference must not half-import: the client catalog would
+  // silently lose the model the agent points at.
+  context.upstream.catalog = {
+    data: { models: [{ id: 'alpha' }], agents: [{ name: 'cli', models: ['ghost'] }] },
+  };
+  const invalid = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(invalid.statusCode, 502);
+  assert.equal(invalid.json<{ error: { code: string } }>().error.code, 'catalog_invalid');
+  assert.deepEqual(stored(), ['alpha', 'beta']);
+
+  // A payload without models at all is rejected the same way.
+  context.upstream.catalog = { data: { models: [], agents: [{ name: 'cli', models: [] }] } };
+  const empty = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(empty.statusCode, 502);
+  assert.deepEqual(stored(), ['alpha', 'beta'], 'an empty payload never wipes the catalog');
+});
+
+test('a credential the upstream refuses is reported as an account problem', async (t) => {
+  const context = await fixture(t, { catalog: false });
+  context.upstream.catalogStatus = 401;
+  const refused = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(refused.statusCode, 502);
+  assert.equal(refused.json<{ error: { code: string } }>().error.code, 'catalog_unauthorized');
+  assert.equal(context.store.accounts()[0]!.needsReauth, true, 'the account is flagged for a new login');
+});
+
+test('a sync without any usable account reports an empty pool', async (t) => {
+  const context = await fixture(t, { catalog: false, account: false });
+  const synced = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(synced.statusCode, 503);
+  assert.equal(synced.json<{ error: { code: string } }>().error.code, 'no_available_account');
+});
+
+test('an unreachable catalog endpoint fails the sync without clearing the models', async (t) => {
+  const upstream = new MockUpstream();
+  upstream.catalogStatus = 502;
+  const context = await fixture(t, { upstream, catalog: false });
+  context.upstream.catalog = catalogPayload([{ id: 'alpha' }]);
+  assert.equal(
+    (await context.app.inject({ method: 'POST', url: '/api/admin/models/sync', headers: context.headers }))
+      .statusCode,
+    502,
   );
 
-  writeFileSync(
-    catalogPath,
-    JSON.stringify({ data: { models: [{ id: 'model-a' }], agents: [{ name: 'cli', models: ['model-b'] }] } }),
-  );
-  await assert.rejects(() => syncCatalog(catalogPath, store), /references unknown model/);
+  context.upstream.catalogError = new Error('fetch failed');
+  const offline = await context.app.inject({
+    method: 'POST',
+    url: '/api/admin/models/sync',
+    headers: context.headers,
+  });
+  assert.equal(offline.statusCode, 502);
+  assert.equal(offline.json<{ error: { code: string } }>().error.code, 'catalog_unreachable');
+  assert.deepEqual(context.store.models(), [], 'a failed sync never writes a partial catalog');
 });
 
 test('the model listing and detail routes only expose enabled models', async (t) => {
@@ -123,35 +214,41 @@ test('the model listing and detail routes only expose enabled models', async (t)
   assert.equal(missing.json<{ error: { code: string } }>().error.code, 'model_not_found');
 });
 
-test('the catalog file is the import source for /api/admin/models/sync', async (t) => {
-  const dataDir = mkdtempSync(join(tmpdir(), 'wkbdy-catalog-'));
-  const catalogPath = join(dataDir, 'catalog.json');
-  writeCatalog(catalogPath, [{ id: 'alpha', supportedLengths: [1000, 2000] }, { id: 'beta' }]);
-  const context = await fixture(t, { env: { catalogPath } });
-  assert.deepEqual(
-    context.store
-      .models()
-      .map((model) => model.id)
-      .sort(),
-    ['alpha', 'beta'],
-    'a fresh install bootstraps its catalog from the configured file',
-  );
-
-  writeCatalog(catalogPath, [{ id: 'alpha', supportedLengths: [1000, 2000] }, { id: 'gamma' }]);
-  const synced = await context.app.inject({
-    method: 'POST',
-    url: '/api/admin/models/sync',
-    headers: context.headers,
+test('a first boot with an account pulls the catalog from the upstream', async (t) => {
+  const dataDir = mkdtempSync(join(tmpdir(), 'wkbdy-boot-'));
+  const seed = openDatabase(dataDir);
+  new Store(seed, new Vault(dataDir)).upsertAccount({
+    name: 'boot account',
+    note: '',
+    source: 'manual',
+    accessToken: 'boot-token-value',
+    refreshToken: '',
+    userId: 'boot-user',
+    domain: 'www.workbuddy.ai',
   });
-  assert.equal(synced.statusCode, 200);
-  assert.deepEqual(synced.json<{ added: number; updated: number; removed: number }>().added, 1);
+  seed.close();
+
+  const upstream = new MockUpstream();
+  upstream.catalog = catalogPayload([{ id: 'boot-model' }]);
+  const context = await createServer({ env: testEnv({ dataDir }), fetcher: upstream.fetch, jobs: false });
+  t.after(async () => {
+    await context.app.close();
+    rmSync(dataDir, { recursive: true, force: true });
+  });
   assert.deepEqual(
-    context.store
-      .models()
-      .map((model) => model.id)
-      .sort(),
-    ['alpha', 'gamma'],
+    context.store.models().map((model) => model.id),
+    ['boot-model'],
+    'a fresh install seeds itself from the product catalog',
   );
-  assert.equal(context.store.model('beta'), undefined);
-  rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('a first boot without accounts still starts and serves an empty catalog', async (t) => {
+  const env = testEnv();
+  const context = await createServer({ env, fetcher: new MockUpstream().fetch, jobs: false });
+  t.after(async () => {
+    await context.app.close();
+    rmSync(env.dataDir, { recursive: true, force: true });
+  });
+  assert.deepEqual(context.store.models(), []);
+  assert.equal((await context.app.inject({ method: 'GET', url: '/health' })).statusCode, 200);
 });

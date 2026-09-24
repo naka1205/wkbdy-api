@@ -36,7 +36,7 @@ curl -i http://127.0.0.1:7891/api/admin/auth/login \
   "version": "1.0.0",
   "started_at": 1730000000000,
   "uptime_ms": 123456,
-  "upstream": { "url": "https://www.workbuddy.ai/v2/chat/completions", "user_agent": "WorkBuddy/2.137.1", "catalog_path": "/app/config/wb_v3config.public.json" },
+  "upstream": { "url": "https://www.workbuddy.ai/v2/chat/completions", "user_agent": "WorkBuddy/2.137.1", "catalog_url": "https://www.workbuddy.ai/v3/config" },
   "availability": { "total": 3, "disabled": 0, "needsReauth": 1, "coolingDown": 0, "available": 2 },
   "pool": { "size": 3, "strategy": "round-robin", "accounts": [ … ] },
   "models": { "total": 12, "enabled": 10 },
@@ -85,10 +85,10 @@ curl -i http://127.0.0.1:7891/api/admin/auth/login \
 | 方法    | 路径                     | 说明                                                                                                   |
 | ------- | ------------------------ | ------------------------------------------------------------------------------------------------------ |
 | `GET`   | `/api/admin/models`      | 所有模型（含未启用）、Agent 白名单与目录同步时间                                                       |
-| `POST`  | `/api/admin/models/sync` | 重新导入 `WKB2API_CATALOG_PATH` 指向的目录                                                             |
+| `POST`  | `/api/admin/models/sync` | 从上游 `/v3/config` 重新拉取产品目录并合并进模型表                                                     |
 | `PATCH` | `/api/admin/models/:id`  | `{ enabled?, context_window? }`，`context_window: null` 清除选择；上下文长度也可由客户端按请求传参覆盖 |
 
-`POST /api/admin/models/sync` 返回 `{ added, updated, removed, models, synced_at }`。目录文件缺失返回 400 `catalog_unreadable`，格式错误返回 400 `catalog_invalid`。
+`POST /api/admin/models/sync` 用账号池里的账号请求产品目录接口，返回 `{ added, updated, removed, models, synced_at, catalog_url }`。没有可用账号返回 503 `no_available_account`；账号被上游拒绝返回 502 `catalog_unauthorized`；接口不可达或返回非 2xx 返回 502 `catalog_unreachable`；载荷非法或为空返回 502 `catalog_invalid`（此时已有模型保持不变）。
 
 ## 客户端密钥
 

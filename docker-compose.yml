@@ -16,7 +16,7 @@ services:
       TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:-}
       WKB2API_UPSTREAM_URL: ${WKB2API_UPSTREAM_URL:-https://www.workbuddy.ai/v2/chat/completions}
       WKB2API_UPSTREAM_UA: ${WKB2API_UPSTREAM_UA:-WorkBuddy/2.137.1}
-      WKB2API_CATALOG_PATH: /app/config/wb_v3config.public.json
+      WKB2API_CATALOG_URL: ${WKB2API_CATALOG_URL:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     volumes:
       - wkbdy-data:/app/data

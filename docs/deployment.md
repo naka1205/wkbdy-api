@@ -16,7 +16,7 @@ docker compose logs -f wkbdy-api
 
 - 容器内以 `node` 用户运行，数据写入命名卷 `wkbdy-data`。
 - 端口默认只映射到宿主机回环地址 `127.0.0.1:7891`，改 `HOST_PORT` 可换端口。
-- 目录文件通过 `WKB2API_CATALOG_PATH=/app/config/wb_v3config.public.json` 注入，自定义目录可挂载覆盖该路径。
+- 模型目录由容器内的账号实时请求上游 `/v3/config` 获取，无需挂载文件；需要指向别的接口时设置 `WKB2API_CATALOG_URL`。
 - 健康检查调用 `/health`。
 
 ## PM2
@@ -105,22 +105,23 @@ cp .env.example .env   # 设置 ADMIN_PASSWORD
 WKB2API_ACCOUNT_STORE_PATH=../WkBdy2api/data/accounts.enc \
 WKB2API_ACCOUNT_STORE_KEY_FILE=../WkBdy2api/account-store.key \
 npm run migrate
-npm run sync:catalog   # 目录写入表结构
+npm run sync:catalog   # 从上游拉取目录并写入表结构
 ```
 
 迁移会保留调度策略、账号备注与 `oauth_origin`（可继续自动刷新），凭证改用新的 `encryption.key` 重新加密。
 
 ## 排障
 
-| 现象                                       | 排查方向                                                                       |
-| ------------------------------------------ | ------------------------------------------------------------------------------ |
-| 启动失败：`Set ADMIN_PASSWORD…`            | `.env` 缺失或密码短于 8 位                                                     |
-| 启动失败：`Cannot decrypt accounts…`       | 数据库与 `encryption.key`/`TOKEN_ENCRYPTION_KEY` 不匹配                        |
-| 启动失败：`Cannot load the model catalog…` | `WKB2API_CATALOG_PATH` 指向的文件不存在或非法；修正后重启                      |
-| `503 upstream_error`                       | 没有可用账号：查看 `GET /api/admin/overview` 的 `availability` 与账号 `detail` |
-| `502 upstream_authentication_error`        | 账号令牌被上游拒绝：重新网页登录                                               |
-| 请求很慢或中途断开                         | 反向代理缓冲/超时；确认 `/v1/` 已关闭 `proxy_buffering`                        |
-| 管理端 401 反复出现                        | Cookie 被代理改写、`PUBLIC_BASE_URL` 协议与实际不一致                          |
-| 目录同步后模型消失                         | 目录文件中的模型被删除或不再属于 `cli` Agent；重新检查文件并同步               |
+| 现象                                           | 排查方向                                                                                                   |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| 启动失败：`Set ADMIN_PASSWORD…`                | `.env` 缺失或密码短于 8 位                                                                                 |
+| 启动失败：`Cannot decrypt accounts…`           | 数据库与 `encryption.key`/`TOKEN_ENCRYPTION_KEY` 不匹配                                                    |
+| 启动后 `/v1/models` 为空                       | 首次拉取需要可用账号：先在面板加账号，或点“同步目录”重试；日志里有 `Could not load the model catalog` 警告 |
+| `503 upstream_error`                           | 没有可用账号：查看 `GET /api/admin/overview` 的 `availability` 与账号 `detail`                             |
+| `502 upstream_authentication_error`            | 账号令牌被上游拒绝：重新网页登录                                                                           |
+| 请求很慢或中途断开                             | 反向代理缓冲/超时；确认 `/v1/` 已关闭 `proxy_buffering`                                                    |
+| 管理端 401 反复出现                            | Cookie 被代理改写、`PUBLIC_BASE_URL` 协议与实际不一致                                                      |
+| 目录同步后模型消失                             | 上游目录里该模型已下线或不再属于 `cli` Agent；以面板的“同步目录”结果为准                                   |
+| `catalog_unauthorized` / `catalog_unreachable` | 读目录的账号被拒或网络不通：重新登录账号，或检查 `WKB2API_CATALOG_URL`                                     |
 
 日志为 JSON 行，包含 `requestId`、`method`、`url`、`status`、`duration_ms`、`api_key`；设为 `LOG_LEVEL=debug` 可看到更详细的调度信息。

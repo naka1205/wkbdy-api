@@ -21,7 +21,7 @@
 | `API_KEYS`                 | 否     | 空                                             | 逗号分隔的初始客户端密钥，仅首次启动导入                          |
 | `WKB2API_UPSTREAM_URL`     | 否     | `https://www.workbuddy.ai/v2/chat/completions` | 首次启动时写入运行时设置；之后以数据库为准                        |
 | `WKB2API_UPSTREAM_UA`      | 否     | `WorkBuddy/2.137.1`                            | 同上；同时决定 OAuth 授权链接的 `version` 参数                    |
-| `WKB2API_CATALOG_PATH`     | 否     | `./config/wb_v3config.public.json`             | 产品目录文件；首次启动导入数据库，之后用于 `models/sync`          |
+| `WKB2API_CATALOG_URL`      | 否     | 空（取上游主机 + `/v3/config`）                | 产品目录接口；留空时从 `WKB2API_UPSTREAM_URL` 推导                |
 | `WKB2API_CREDENTIALS_PATH` | 否     | 空                                             | 本机 WorkBuddy 凭据文件；设置后才启用“导入本机账号”               |
 | `TOKEN_ENCRYPTION_KEY`     | 否     | 空                                             | base64 编码的 32 字节密钥；不设置时使用 `DATA_DIR/encryption.key` |
 | `WKB2API_DUMP_DIR`         | 否     | 空                                             | 协议抓包目录；设置后把客户端/上游的**原始**报文写入 JSONL（见下） |
@@ -88,7 +88,7 @@ Invalid configuration:
 
 ## 模型目录
 
-目录文件是 WorkBuddy 的产品配置（`/v3/config` 的响应）。最小结构：
+目录来自 WorkBuddy 的产品配置接口（上游主机下的 `/v3/config`，即客户端启动时请求的同一个接口）。它需要账号令牌，匿名请求只返回空壳。响应结构：
 
 ```json
 {
@@ -117,7 +117,9 @@ Invalid configuration:
 - Agent 引用的模型必须存在于 `models` 中，否则导入失败（`catalog_invalid`）。
 - 客户端可见的模型 = `cli` Agent 列出的模型 ∩ 面板中启用的模型。
 
-导入方式：首次启动自动导入；之后用管理端“同步目录”按钮、`POST /api/admin/models/sync` 或 `npm run sync:catalog [文件]`。导入会保留面板的启停与上下文选择，删除文件中已消失的模型。
+接口地址由运行时设置的上游地址推导（`https://www.workbuddy.ai/v2/chat/completions` → `https://www.workbuddy.ai/v3/config`），可用 `WKB2API_CATALOG_URL` 覆盖。
+
+导入方式：首次启动自动拉取（失败只记警告，不影响启动）；之后用管理端“同步目录”按钮、`POST /api/admin/models/sync` 或 `npm run sync:catalog`。每次导入都会实时请求上游，不再依赖本地文件；导入会保留面板的启停与上下文选择，删除新目录中已消失的模型，空载荷或非法载荷会整体拒绝，不会清空已有模型。
 
 ## 数据目录
 

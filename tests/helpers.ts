@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,8 +8,9 @@ import type { EnvConfig } from '../src/config.js';
 import { parseProductConfig, toExposedModel } from '../src/catalog.js';
 import { fromExposed } from '../src/models.js';
 
-export const CATALOG_PATH = fileURLToPath(new URL('../config/wb_v3config.public.json', import.meta.url));
 export const PROJECT_ROOT = fileURLToPath(new URL('..', import.meta.url));
+/** Captured `/v3/config` payload the fake upstream serves and tests import. */
+export const CATALOG_FIXTURE = fileURLToPath(new URL('./fixtures/catalog.json', import.meta.url));
 export const ADMIN_PASSWORD = 'unit-test-password';
 export const API_KEY = 'sk-wk-test-key-0123456789abcdef';
 
@@ -61,15 +62,28 @@ export type UpstreamCall = { url: string; headers: Headers; body: Record<string,
 /** Records every upstream call and answers with a queued or computed response. */
 export class MockUpstream {
   readonly calls: UpstreamCall[] = [];
+  /** Payload the fake product catalog endpoint answers with. */
+  catalog: unknown = catalogPayload();
+  /** Non-2xx makes the catalog endpoint fail instead of answering. */
+  catalogStatus = 200;
+  /** Thrown instead of answering, to exercise network failures. */
+  catalogError?: Error;
   handler: (call: UpstreamCall) => Response | Promise<Response> = () => sse(streamPayload);
 
   readonly fetch = (async (url: string | URL, init?: RequestInit) => {
+    const target = String(url);
     const call: UpstreamCall = {
-      url: String(url),
+      url: target,
       headers: new Headers(init?.headers),
       body: init?.body ? JSON.parse(String(init.body)) : {},
     };
     this.calls.push(call);
+    // The product catalog shares the upstream host with the chat endpoint.
+    if (target.endsWith('/v3/config')) {
+      if (this.catalogError) throw this.catalogError;
+      if (this.catalogStatus !== 200) return new Response('rejected', { status: this.catalogStatus });
+      return json(this.catalog);
+    }
     return this.handler(call);
   }) as unknown as typeof fetch;
 
@@ -83,7 +97,7 @@ export class MockUpstream {
 }
 
 export function testEnv(overrides: Partial<EnvConfig> = {}): EnvConfig {
-  const dataDir = mkdtempSync(join(tmpdir(), 'wkbdy-api-test-'));
+  const dataDir = overrides.dataDir ?? mkdtempSync(join(tmpdir(), 'wkbdy-api-test-'));
   return {
     host: '127.0.0.1',
     port: 0,
@@ -91,7 +105,6 @@ export function testEnv(overrides: Partial<EnvConfig> = {}): EnvConfig {
     dataDir,
     staticDir: join(dataDir, 'static'),
     publicBaseUrl: 'http://localhost:7891',
-    catalogPath: CATALOG_PATH,
     apiKeys: [API_KEY],
     logLevel: 'silent',
     dumpRedact: false,
@@ -99,9 +112,31 @@ export function testEnv(overrides: Partial<EnvConfig> = {}): EnvConfig {
   };
 }
 
-/** The bundled product config, parsed. */
+/** The captured product config, parsed. */
 export function bundledConfig() {
-  return parseProductConfig(JSON.parse(readFileSync(CATALOG_PATH, 'utf8')));
+  return parseProductConfig(JSON.parse(readFileSync(CATALOG_FIXTURE, 'utf8')));
+}
+
+/** A minimal `/v3/config` payload; without arguments, the captured one. */
+export function catalogPayload(
+  models?: Array<{ id: string; supportedLengths?: number[] }>,
+): Record<string, unknown> {
+  if (!models) return JSON.parse(readFileSync(CATALOG_FIXTURE, 'utf8')) as Record<string, unknown>;
+  return {
+    data: {
+      models: models.map((model) => ({
+        id: model.id,
+        name: model.id,
+        isDefault: false,
+        supportsToolCall: true,
+        supportsReasoning: true,
+        contextWindow: model.supportedLengths
+          ? { defaultLength: model.supportedLengths[0], supportedLengths: model.supportedLengths }
+          : undefined,
+      })),
+      agents: [{ name: 'cli', models: models.map((model) => model.id) }],
+    },
+  };
 }
 
 /** Catalog models from the bundled product config, ready for `store.importCatalog`. */
@@ -119,7 +154,14 @@ export function bundledCatalog() {
 
 export async function fixture(
   t: TestContext,
-  options: { upstream?: MockUpstream; env?: Partial<EnvConfig> } = {},
+  options: {
+    upstream?: MockUpstream;
+    env?: Partial<EnvConfig>;
+    /** `false` starts with an empty model table, for catalog sync tests. */
+    catalog?: boolean;
+    /** `false` skips the demo account, for "nothing to schedule" tests. */
+    account?: boolean;
+  } = {},
 ) {
   const upstream = options.upstream ?? new MockUpstream();
   const env = testEnv(options.env);
@@ -135,15 +177,17 @@ export async function fixture(
     payload: { password: ADMIN_PASSWORD },
   });
   const cookie = String(login.headers['set-cookie']).split(';')[0];
-  context.store.upsertAccount({
-    name: 'test account',
-    note: '',
-    source: 'manual',
-    accessToken: 'test-access-token-value',
-    refreshToken: '',
-    userId: 'user-1',
-    domain: 'www.workbuddy.ai',
-  });
+  if (options.account !== false)
+    context.store.upsertAccount({
+      name: 'test account',
+      note: '',
+      source: 'manual',
+      accessToken: 'test-access-token-value',
+      refreshToken: '',
+      userId: 'user-1',
+      domain: 'www.workbuddy.ai',
+    });
+  if (options.catalog !== false) context.store.importCatalog(bundledCatalog());
   return {
     ...context,
     upstream,
@@ -151,27 +195,6 @@ export async function fixture(
     headers: { cookie, 'x-admin-request': '1' },
     apiHeaders: { authorization: `Bearer ${API_KEY}` },
   };
-}
-
-export function writeCatalog(path: string, models: Array<{ id: string; supportedLengths?: number[] }>) {
-  writeFileSync(
-    path,
-    JSON.stringify({
-      data: {
-        models: models.map((model) => ({
-          id: model.id,
-          name: model.id,
-          isDefault: false,
-          supportsToolCall: true,
-          supportsReasoning: true,
-          contextWindow: model.supportedLengths
-            ? { defaultLength: model.supportedLengths[0], supportedLengths: model.supportedLengths }
-            : undefined,
-        })),
-        agents: [{ name: 'cli', models: models.map((model) => model.id) }],
-      },
-    }),
-  );
 }
 
 export type Fixture = Awaited<ReturnType<typeof fixture>>;

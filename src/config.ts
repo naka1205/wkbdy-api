@@ -2,10 +2,22 @@ import 'dotenv/config';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 
-const httpUrl = z
-  .string()
-  .url()
-  .refine((value) => ['http:', 'https:'].includes(new URL(value).protocol), 'HTTP(S) URL required');
+const httpUrl = z.string().refine((value) => {
+  try {
+    return ['http:', 'https:'].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}, 'HTTP(S) URL required');
+
+/**
+ * Optional URLs treat a blank `.env` entry as "not set" — the templates ship
+ * them empty on purpose, so an empty string must not fail validation.
+ */
+const optionalHttpUrl = z.preprocess(
+  (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+  httpUrl.optional(),
+);
 
 /**
  * Runtime settings live in the database, not in .env, so the panel can change
@@ -67,7 +79,8 @@ export interface EnvConfig {
   dataDir: string;
   staticDir: string;
   publicBaseUrl: string;
-  catalogPath: string;
+  /** Overrides the product catalog URL; defaults to `{upstream origin}/v3/config`. */
+  catalogUrl?: string;
   /** Optional startup seed for the runtime upstream settings. */
   upstreamUrl?: string;
   upstreamUserAgent?: string;
@@ -87,7 +100,8 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
       PORT: z.coerce.number().int().min(1).max(65535).default(7891),
       HOST: z.string().default('127.0.0.1'),
       ADMIN_PASSWORD: z.string().min(8, 'Set ADMIN_PASSWORD to at least 8 characters in .env'),
-      PUBLIC_BASE_URL: httpUrl.optional(),
+      PUBLIC_BASE_URL: optionalHttpUrl,
+      WKB2API_CATALOG_URL: optionalHttpUrl,
       LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'silent']).default('info'),
     })
     .parse(env);
@@ -98,7 +112,7 @@ export function loadEnv(env: NodeJS.ProcessEnv = process.env): EnvConfig {
     dataDir: resolve(env.DATA_DIR || './data'),
     staticDir: resolve(env.STATIC_DIR || './static'),
     publicBaseUrl: raw.PUBLIC_BASE_URL || `http://localhost:${raw.PORT}`,
-    catalogPath: resolve(env.WKB2API_CATALOG_PATH || './config/wb_v3config.public.json'),
+    ...(raw.WKB2API_CATALOG_URL ? { catalogUrl: raw.WKB2API_CATALOG_URL } : {}),
     ...(env.WKB2API_UPSTREAM_URL ? { upstreamUrl: env.WKB2API_UPSTREAM_URL } : {}),
     ...(env.WKB2API_UPSTREAM_UA ? { upstreamUserAgent: env.WKB2API_UPSTREAM_UA } : {}),
     encryptionKey: env.TOKEN_ENCRYPTION_KEY || undefined,
