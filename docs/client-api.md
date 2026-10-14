@@ -73,11 +73,12 @@ Base URL：`http://<host>:<port>/v1`；鉴权：`Authorization: Bearer <客户�
 | `stream_options.include_usage`                | `true` 时在流末尾追加 usage-only chunk                                                                                                                                               |
 | `user`                                        | 透传                                                                                                                                                                                 |
 
-以下参数网关不转发（上游不支持）：`logprobs`、`top_logprobs`、`response_format`、`seed`、`presence_penalty`、`frequency_penalty`、`n`、`store`、`metadata`、`logit_bias`、`functions`、`function_call`、`audio`、`modalities`、`prediction`、`web_search_options`、`service_tier`、`speed`。
+以下参数网关不转发（上游不支持）：`logprobs`、`top_logprobs`、`response_format`、`seed`、`presence_penalty`、`frequency_penalty`、`n`、`store`、`metadata`、`logit_bias`、`functions`、`function_call`、`audio`、`modalities`、`prediction`、`web_search_options`、`service_tier`、`speed`；消息级别的 `messages[].reasoning_content`（客户端回传上一轮思考内容）同样接收但不转发。
 
 其他说明：
 
 - **未知参数不会让请求失败**：任何网关不认识的顶层字段（新版本 OpenAI 字段、客户端私有字段）都会被忽略并记入请求日志的「详细信息」，而不是返回 400。原因是 Agent 客户端的一个参数就足以中断整个任务，代价远高于静默丢弃；上游能力边界以内的字段则照常转发。
+- 上面这些「被忽略」的记录只写进请求日志的 `detail`，控制台仅在 `LOG_LEVEL=debug` 时打印：同一个 Agent 客户端每一轮都会带上同样的额外字段，按 warn 打印会把运维终端刷屏（正文里的 `store`、`messages[].reasoning_content` 属于网关认识的字段，不再计入被忽略列表）。
 - 只有请求体结构性错误才返回 400 `invalid_request`（缺少 `model`、`messages` 为空、字段类型不符），错误消息会指出具体字段。
 - `messages[0]` 不是 `system`/`developer` 时会自动插入 `You are a helpful assistant.`。
 - 上游只接受流式请求，因此非流式调用由网关聚合后再返回。

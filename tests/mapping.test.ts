@@ -127,6 +127,37 @@ test('fields dropped from inside a message are reported', () => {
   );
 });
 
+test('fields the gateway itself emits are not reported as unsupported', () => {
+  // The gateway puts reasoning_content on its own responses; a client that keeps
+  // a transcript echoes it back on every later turn, and `store` is a standard
+  // OpenAI flag with no upstream equivalent. Neither is an unknown parameter, so
+  // neither may be logged — an agent turn must not print a warning per message.
+  assert.deepEqual(
+    ignoredRequestFields({
+      model: 'm',
+      store: false,
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'x', reasoning_content: 'thinking…' },
+      ],
+      prompt_cache_key: 'abc',
+    }),
+    ['prompt_cache_key'],
+  );
+});
+
+test('a transcript echoing reasoning still parses and is not forwarded upstream', () => {
+  const request = parse({
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'x', reasoning_content: 'thinking…' },
+    ],
+  });
+  const upstream = toUpstreamRequest(request);
+  assert.deepEqual(upstream.messages.at(-1), { role: 'assistant', content: 'x' });
+});
+
 test('"[undefined]" placeholders from loose clients are dropped', () => {
   const body = normalizeOpenAiRequestBody({
     model: 'm',

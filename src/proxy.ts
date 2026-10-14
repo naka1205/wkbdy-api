@@ -81,11 +81,13 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
 
     // Tolerate parameters this gateway does not model. A client that ships a
     // newer OpenAI field, or a provider-specific extra, must not lose a whole
-    // agent turn to a 400: the schema strips it and we record the fact.
+    // agent turn to a 400: the schema strips it and we record the fact on the
+    // request log row. Kept at debug: an agent that sends the same extra on
+    // every turn would otherwise flood the operator's console.
     const ignored = ignoredRequestFields(body);
     if (ignored.length) {
       notes.push(`ignored unsupported parameters: ${ignored.join(', ')}`);
-      req.log.warn({ ignored }, 'ignored unsupported chat parameters');
+      req.log.debug({ ignored }, 'ignored unsupported chat parameters');
     }
     if (body.max_tokens !== undefined && body.max_completion_tokens !== undefined) {
       notes.push('both max_tokens and max_completion_tokens were sent; max_tokens wins');
@@ -130,7 +132,9 @@ export function chatCompletionsRoutes(app: FastifyInstance, opts: ChatOpts): voi
     if (rewritten.length) {
       notes.push(`rewrote client prompt fingerprints: ${rewritten.join(', ')}`);
       note = notes.join('; ');
-      req.log.warn({ rules: rewritten }, 'sanitized system prompt before upstream');
+      // Expected for the known agent clients, so it is logged per request on
+      // the request log row rather than on the console.
+      req.log.debug({ rules: rewritten }, 'sanitized system prompt before upstream');
     }
     const abort = new AbortController();
     // Node fires 'close' on the request stream once the body is consumed —

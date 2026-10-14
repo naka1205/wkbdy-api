@@ -81,7 +81,7 @@ WorkBuddy 上游会按**系统提示内容**识别客户端：命中已知第三
 
 每次调用记录：请求 ID、时间、密钥、模型、账号、端点、是否流式、状态码、耗时、输入/输出 Token、上游 credit 计费值、错误码与详细信息。
 
-`detail` 是给排障用的自然语言说明：失败时是校验或上游的原始消息（例如 `messages: messages must contain at least one message`），成功时是被忽略的客户端参数列表。面板「请求日志」详情里可以直接看到，列表里的错误码也有悬停提示。
+`detail` 是给排障用的自然语言说明：失败时是校验或上游的原始消息（例如 `messages: messages must contain at least one message`），成功时是被忽略的客户端参数列表。面板「请求日志」详情里可以直接看到，列表里的错误码也有悬停提示。这些逐请求的说明只落在 `detail` 上，控制台按 `debug` 输出：Agent 客户端每一轮都带同样的额外字段，用 warn 打印会把运维终端刷屏，只剩请求日志可见。
 
 `cache_hit_tokens` / `reasoning_tokens` 取自上游 usage（`prompt_cache_hit_tokens`/`prompt_tokens_details.cached_tokens` 与 `completion_thinking_tokens`/`completion_tokens_details.reasoning_tokens`），面板详情可见；统计接口额外给出 `stats.cacheHitTokens24h`，控制台用它显示缓存命中率。
 

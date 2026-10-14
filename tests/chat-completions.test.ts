@@ -161,6 +161,27 @@ test('max_tokens wins when a client sends both token limits', async (t) => {
   assert.match(context.store.logs().entries[0]!.detail ?? '', /max_completion_tokens/);
 });
 
+test('a transcript echoing reasoning_content leaves the log row clean', async (t) => {
+  const context = await fixture(t);
+  const response = await post(context, {
+    model: 'deepseek-v4.1-flash',
+    store: false,
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'hello', reasoning_content: 'thought about it' },
+    ],
+  });
+  assert.equal(response.statusCode, 200);
+  // Accepted but not forwarded, and not reported: the console line only fires
+  // for genuinely unknown parameters, so a long transcript cannot flood it.
+  assert.deepEqual(context.upstream.last!.body.messages, [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'hi' },
+    { role: 'assistant', content: 'hello' },
+  ]);
+  assert.equal(context.store.logs().entries[0]!.detail, null);
+});
+
 test('a structurally invalid request is rejected with a field-level message', async (t) => {
   const context = await fixture(t);
   const invalid = await post(context, { model: '', messages });

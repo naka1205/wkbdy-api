@@ -67,11 +67,12 @@ export function ignoredRequestFields(body: Record<string, unknown>): string[] {
 
 /**
  * Message-level fields the schema strips. A client that sends, say, a legacy
- * \`function_call\` would otherwise lose it without a trace.
+ * \`function_call\` would otherwise lose it without a trace. The known-field set
+ * is read off the schema itself, so it cannot drift from what is forwarded.
  */
 function droppedMessageFields(messages: unknown): string[] {
   if (!Array.isArray(messages)) return [];
-  const knownMessageFields = new Set(['role', 'content', 'name', 'tool_calls', 'tool_call_id']);
+  const knownMessageFields = new Set(Object.keys(messageSchema.shape));
   const out: string[] = [];
   messages.forEach((message, index) => {
     if (!message || typeof message !== 'object' || Array.isArray(message)) return;
@@ -88,23 +89,28 @@ function droppedMessageFields(messages: unknown): string[] {
  * declared; anything else is stripped by zod and reported by the route, which
  * keeps unknown client parameters from breaking a call.
  */
+/**
+ * One turn of a client transcript. `reasoning_content` is declared because this
+ * gateway emits that field on responses and a client that keeps a transcript
+ * echoes it back on every later turn; it is accepted and dropped rather than
+ * reported as an unsupported parameter (see toUpstreamRequest).
+ */
+const messageSchema = z.object({
+  // 'function' is the pre-'tool' role; older transcripts still carry it.
+  role: z.enum(['system', 'developer', 'user', 'assistant', 'tool', 'function']),
+  // A tool-calling assistant turn legitimately has "content": null, and
+  // some clients send a single content part as an object instead of an
+  // array. Both are forwarded as-is; the upstream is the final judge.
+  content: z.union([z.string(), z.array(z.any()), z.record(z.any()), z.null()]).optional(),
+  name: z.string().optional(),
+  tool_calls: z.array(z.any()).optional(),
+  tool_call_id: z.string().optional(),
+  reasoning_content: z.string().optional(),
+});
+
 export const chatRequestSchema = z.object({
   model: z.string().min(1),
-  messages: z
-    .array(
-      z.object({
-        // 'function' is the pre-'tool' role; older transcripts still carry it.
-        role: z.enum(['system', 'developer', 'user', 'assistant', 'tool', 'function']),
-        // A tool-calling assistant turn legitimately has "content": null, and
-        // some clients send a single content part as an object instead of an
-        // array. Both are forwarded as-is; the upstream is the final judge.
-        content: z.union([z.string(), z.array(z.any()), z.record(z.any()), z.null()]).optional(),
-        name: z.string().optional(),
-        tool_calls: z.array(z.any()).optional(),
-        tool_call_id: z.string().optional(),
-      }),
-    )
-    .min(1, 'messages must contain at least one message'),
+  messages: z.array(messageSchema).min(1, 'messages must contain at least one message'),
   stream: z.boolean().default(false),
   temperature: z.number().min(0).max(2).optional(),
   top_p: z.number().min(0).max(1).optional(),
@@ -135,6 +141,9 @@ export const chatRequestSchema = z.object({
   thinking: thinkingSchema.optional(),
   context_window: z.number().int().positive().optional(),
   user: z.string().optional(),
+  // Standard OpenAI flag with no upstream equivalent; accepted so a client that
+  // sends it is not reported as carrying an unsupported parameter.
+  store: z.boolean().optional(),
   stream_options: z.object({ include_usage: z.boolean().optional() }).optional(),
 });
 
@@ -190,6 +199,9 @@ export function toUpstreamRequest(req: ChatRequest): UpstreamChatRequest {
  * system message is injected. Everything else passes through unchanged.
  */
 export function normalizeMessages(messages: ChatRequest['messages']): UpstreamChatRequest['messages'] {
+  // The upstream is fed one explicit field list per message: client extras the
+  // upstream does not read (`reasoning_content`, `function_call`, …) are left
+  // behind here rather than forwarded.
   const mapped = messages.map((m) => ({
     role: m.role === 'developer' ? 'system' : m.role,
     content: m.content,

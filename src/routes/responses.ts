@@ -83,10 +83,12 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     }
 
     // Unknown top-level fields are ignored rather than rejected; see proxy.ts.
+    // The note lands on the request log row, and stays off the console so a
+    // client that sends the same extra on every turn cannot flood it.
     const ignoredFields = Object.keys(body).filter((key) => !RESPONSES_REQUEST_FIELDS.has(key));
     if (ignoredFields.length) {
       notes.push(`ignored unsupported parameters: ${ignoredFields.join(', ')}`);
-      req.log.warn({ ignored: ignoredFields }, 'ignored unsupported responses parameters');
+      req.log.debug({ ignored: ignoredFields }, 'ignored unsupported responses parameters');
     }
     note = notes.length ? notes.join('; ') : null;
 
@@ -162,7 +164,7 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     if (mapped.ignored.length) {
       notes.push(`ignored input items: ${mapped.ignored.slice(0, 10).join(', ')}`);
       note = notes.join('; ');
-      req.log.warn({ ignored: mapped.ignored }, 'ignored unsupported responses items');
+      req.log.debug({ ignored: mapped.ignored }, 'ignored unsupported responses items');
     }
     const upstream = mapped.upstream;
     // WorkBuddy blocks the system prompts of known third-party clients; a
@@ -171,7 +173,8 @@ export function responsesRoutes(app: FastifyInstance, opts: ResponsesOptions): v
     if (rewritten.length) {
       notes.push(`rewrote client prompt fingerprints: ${rewritten.join(', ')}`);
       note = notes.join('; ');
-      req.log.warn({ rules: rewritten }, 'sanitized system prompt before upstream');
+      // Expected for the known agent clients; recorded on the log row only.
+      req.log.debug({ rules: rewritten }, 'sanitized system prompt before upstream');
     }
 
     const abort = new AbortController();
