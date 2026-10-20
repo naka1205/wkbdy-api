@@ -27,6 +27,15 @@ test('a non-streaming request is aggregated from the upstream stream', async (t)
   assert.equal(sent.headers.get('x-product'), 'SaaS');
   assert.match(sent.headers.get('user-agent') ?? '', /^WorkBuddy\//);
   assert.match(sent.headers.get('authorization') ?? '', /^Bearer /);
+  // Upstream channel verification rejects calls missing any of these three.
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  for (const name of [
+    'x-conversation-id',
+    'x-conversation-request-id',
+    'x-conversation-message-id',
+  ]) {
+    assert.match(sent.headers.get(name) ?? '', uuid);
+  }
 
   const logged = context.store.logs();
   assert.equal(logged.total, 1);

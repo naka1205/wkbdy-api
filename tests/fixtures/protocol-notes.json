@@ -13,9 +13,12 @@
       "X-User-Id": "<account.uid>",
       "X-Domain": "www.workbuddy.ai",
       "X-Product": "SaaS",
+      "X-Conversation-ID": "<uuid>",
+      "X-Conversation-Request-ID": "<uuid>",
+      "X-Conversation-Message-ID": "<uuid>",
       "User-Agent": "WorkBuddy/2.137.1（必须单段格式，双段 UA 被 400 code:12403 拒绝）"
     },
-    "static_evidence": "bundle codebuddy.js resolveModelBaseURL 返回 `${endpoint}/v2`，OpenAI SDK baseURL 再拼 /chat/completions；其他 X-* 内部头（X-Request-ID/X-Conversation-ID/X-IDE-* 等）为 CLI 遥测/会话头，实测不带这些头也能正常响应，2API 无需注入"
+    "static_evidence": "bundle codebuddy.js resolveModelBaseURL 返回 `${endpoint}/v2`，OpenAI SDK baseURL 再拼 /chat/completions。2026-10-20 上游启用渠道校验：缺少 X-Conversation-ID、X-Conversation-Request-ID、X-Conversation-Message-ID 任一都会返回 400 {code:11128,msg:'request illegal'}；三者均为 UUID 时旧 UA 也可通过。"
   },
   "request_body_rules": {
     "format": "OpenAI Chat Completions 标准格式",

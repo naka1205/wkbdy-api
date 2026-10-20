@@ -11,8 +11,11 @@
       "X-User-Id": "***REDACTED***",
       "X-Domain": "www.workbuddy.ai",
       "X-Product": "SaaS",
+      "X-Conversation-ID": "***REDACTED UUID***",
+      "X-Conversation-Request-ID": "***REDACTED UUID***",
+      "X-Conversation-Message-ID": "***REDACTED UUID***",
       "User-Agent": "WorkBuddy/2.137.1",
-      "_notes": "UA 必须是单段 '名/版本' 格式；双段 CLI/WorkBuddy AI 格式会被 400 code:12403 拒绝（校验的是 coding copilot version 解析）。认证与用户头缺失时行为未单独测试（避免无谓请求），静态证据表明 CLI 每个模型请求都注入 Authorization + X-User-Id。"
+      "_notes": "2026-10-20 实测上游增加渠道校验：三个 X-Conversation-* 头缺一不可，否则返回 400 code:11128 request illegal。UA 继续使用单段 '名/版本' 格式；双段格式曾被 400 code:12403 拒绝。"
     }
   },
   "body": {

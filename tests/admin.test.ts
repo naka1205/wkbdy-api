@@ -90,6 +90,14 @@ test('accounts can be added, verified, patched and removed', async (t) => {
     headers: context.headers,
   });
   assert.deepEqual(verified.json<{ ok: boolean }>().ok, true);
+  const verifyCall = context.upstream.last!;
+  for (const name of [
+    'x-conversation-id',
+    'x-conversation-request-id',
+    'x-conversation-message-id',
+  ]) {
+    assert.ok(verifyCall.headers.get(name), `credential verification must send ${name}`);
+  }
 
   context.upstream.handler = () => json({ code: 401, msg: 'bad token' }, 401);
   const rejected = await context.app.inject({

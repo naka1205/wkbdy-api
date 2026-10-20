@@ -123,6 +123,20 @@ export type UpstreamStream = {
   upstreamRequestId?: string;
 };
 
+/**
+ * WorkBuddy's channel verification rejects otherwise-valid chat requests with
+ * `400 code:11128 request illegal` unless all three conversation headers are
+ * present. The IDs are opaque to the model, so fresh UUIDs are sufficient for
+ * gateway-originated turns.
+ */
+function conversationHeaders(): Record<string, string> {
+  return {
+    'X-Conversation-ID': randomUUID(),
+    'X-Conversation-Request-ID': randomUUID(),
+    'X-Conversation-Message-ID': randomUUID(),
+  };
+}
+
 /** Thin transport over the WorkBuddy chat endpoint. Client disconnects still cancel the upstream stream. */
 export class WorkBuddyClient {
   private readonly fetchFn: typeof fetch;
@@ -252,6 +266,7 @@ export class WorkBuddyClient {
       'X-Product': 'SaaS',
       'X-Request-ID': randomUUID(),
       'User-Agent': this.userAgent,
+      ...conversationHeaders(),
     };
     const body: UpstreamChatRequest = {
       model: 'deepseek-v4.1-flash',
@@ -356,6 +371,7 @@ export class WorkBuddyClient {
       'X-Domain': cred.domain,
       'X-Product': 'SaaS',
       'User-Agent': this.userAgent,
+      ...conversationHeaders(),
     };
     // The upstream echoes this header back (and reports it in error bodies),
     // which makes the two sides of one call traceable with a single ID.
